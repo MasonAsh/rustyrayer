@@ -71,12 +71,11 @@ impl Iterator for FaceIter<'_> {
             )
         }
 
-        self.face_idx += 1;
-
         let geometry = self.geometry;
 
         let indices_idx = (self.face_idx * 3) as usize;
-        if indices_idx < geometry.indices.len() - 2 {
+        self.face_idx += 1;
+        if indices_idx < geometry.indices.len() {
             let index0 = geometry.indices[indices_idx];
             let index1 = geometry.indices[indices_idx + 1];
             let index2 = geometry.indices[indices_idx + 2];
