@@ -1,0 +1,15 @@
+[package]
+name = "rustyrayer"
+version = "0.1.0"
+authors = ["Mason Ashbridge"]
+edition = "2018"
+license = "MIT or Apache-2.0"
+
+[dependencies]
+image = "0.21.0"
+log = "0.4"
+env_logger = "0.6.0"
+
+[dependencies.cgmath]
+version = "0.17.0"
+features = ["swizzle"]
