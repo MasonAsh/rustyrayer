@@ -1,10 +1,16 @@
 use cgmath::{
-    perspective, vec3, vec4, Angle, Deg, InnerSpace, Matrix4, Point3, Transform, Vector3,
+    perspective, vec3, vec4, Angle, Deg, EuclideanSpace, InnerSpace, Matrix4, Point3, Quaternion,
+    Rad, Rotation3, Transform, Vector3,
 };
 use env_logger;
 use image;
 use image::ImageBuffer;
 use log::debug;
+use sdl2;
+use sdl2::event::Event;
+use sdl2::keyboard::Keycode;
+use sdl2::mouse::MouseButton;
+use sdl2::pixels::PixelFormatEnum;
 
 type Vec3 = Vector3<f32>;
 type Mat4 = Matrix4<f32>;
@@ -293,11 +299,12 @@ fn trace(scene: &Scene, ray: &Ray, background_color: u32) -> u32 {
     }
 }
 
-fn render(scene: &Scene, render_settings: &RenderSettings) {
+fn render(scene: &Scene, render_settings: &RenderSettings) -> ImageBuffer<image::Rgb<u8>, Vec<u8>> {
     let (res_w, res_h) = render_settings.resolution;
     let ortho_width = scene.camera.ortho_width;
     let ortho_height = scene.camera.ortho_height;
-    let imgbuf = ImageBuffer::from_fn(res_w, res_h, |x, y| {
+
+    ImageBuffer::from_fn(res_w, res_h, |x, y| {
         let x = x as f32;
         let y = y as f32;
         let res_w = res_w as f32;
@@ -324,18 +331,129 @@ fn render(scene: &Scene, render_settings: &RenderSettings) {
         let green = (color & 0x00_FF_00_00) >> 16;
         let blue = (color & 0x00_00_FF_00) >> 8;
         image::Rgb([red as u8, green as u8, blue as u8])
-    });
+    })
+}
 
-    imgbuf.save("image.png").unwrap();
+fn interactive_loop(scene: &mut Scene, render_settings: &RenderSettings) {
+    let sdl_context = sdl2::init().unwrap();
+    let video_subsystem = sdl_context.video().unwrap();
+
+    let (res_w, res_h) = render_settings.resolution;
+
+    let window = video_subsystem
+        .window("rustyrayer", res_w, res_h)
+        .position_centered()
+        .build()
+        .unwrap();
+
+    let mut canvas = window.into_canvas().build().unwrap();
+    let texture_creator = canvas.texture_creator();
+    let mut texture = texture_creator
+        .create_texture_streaming(PixelFormatEnum::RGB24, res_w, res_h)
+        .unwrap();
+
+    canvas.clear();
+    canvas.present();
+
+    let mut event_pump = sdl_context.event_pump().unwrap();
+    let mut needs_redraw = true;
+
+    let mut mouse_down = false;
+
+    // Camera orbit parameters
+    let mut orbit_dist = 5.0f32;
+    let mut yaw = Rad(0.0f32);
+    let mut pitch = Rad(0.0f32);
+
+    'running: loop {
+        for event in event_pump.poll_iter() {
+            match event {
+                Event::Quit { .. } => break 'running,
+                Event::KeyDown {
+                    keycode: Some(Keycode::W),
+                    ..
+                } => {
+                    orbit_dist *= 0.7;
+                    needs_redraw = true;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::S),
+                    ..
+                } => {
+                    orbit_dist *= 1.3;
+                    needs_redraw = true;
+                }
+                Event::MouseButtonDown {
+                    mouse_btn: MouseButton::Left,
+                    ..
+                } => {
+                    mouse_down = true;
+                }
+                Event::MouseButtonUp {
+                    mouse_btn: MouseButton::Left,
+                    ..
+                } => {
+                    mouse_down = false;
+                }
+                Event::MouseMotion { xrel, yrel, .. } => {
+                    if mouse_down {
+                        yaw -= Rad((xrel as f32) * 0.008);
+                        pitch += Rad((yrel as f32) * 0.008);
+                        needs_redraw = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if needs_redraw {
+            // Orbit the camera with our yaw and pitch angles
+            let camera_position = Quaternion::from_angle_y(-yaw)
+                * Quaternion::from_angle_x(pitch)
+                * vec3(0.0, 0.0, orbit_dist);
+
+            // Mat4::look_at requires a Point3
+            let camera_position = Point3::from_vec(camera_position);
+
+            scene.camera.view = Mat4::look_at(
+                camera_position,
+                Point3::new(0.0, 0.0, 0.0),
+                vec3(0.0, 1.0, 0.0),
+            );
+
+            canvas.clear();
+
+            texture
+                .with_lock(None, |buffer: &mut [u8], _pitch: usize| {
+                    let imgbuf = render(scene, render_settings);
+                    buffer.copy_from_slice(&*imgbuf);
+                })
+                .unwrap();
+
+            canvas.copy(&texture, None, None).unwrap();
+
+            canvas.present();
+
+            needs_redraw = false;
+        }
+    }
 }
 
 fn main() {
     env_logger::init();
 
-    let scene = create_scene();
+    let mut scene = create_scene();
     let render_settings = RenderSettings {
-        resolution: (2000, 2000),
+        resolution: (640, 480),
         background_color: 0,
     };
-    render(&scene, &render_settings);
+
+    let interactive_mode = std::env::args().any(|arg| arg == "--interactive");
+
+    if interactive_mode {
+        interactive_loop(&mut scene, &render_settings);
+    } else {
+        let imgbuf = render(&scene, &render_settings);
+        imgbuf.save("image.png").unwrap();
+    }
 }
