@@ -1,10 +1,10 @@
 use cgmath::{
-    perspective, vec3, vec4, Angle, Deg, EuclideanSpace, InnerSpace, Matrix4, Point3, Quaternion,
-    Rad, Rotation3, Transform, Vector3,
+    perspective, vec2, vec3, vec4, Angle, Deg, EuclideanSpace, InnerSpace, Matrix4, Point3,
+    Quaternion, Rad, Rotation3, Transform, Vector2, Vector3,
 };
 use env_logger;
 use image;
-use image::ImageBuffer;
+use image::{DynamicImage, GenericImageView, ImageBuffer, Pixel};
 use log::debug;
 use sdl2;
 use sdl2::event::Event;
@@ -12,6 +12,15 @@ use sdl2::keyboard::Keycode;
 use sdl2::mouse::MouseButton;
 use sdl2::pixels::PixelFormatEnum;
 
+macro_rules! debug_if(
+    ( $enable_debug:expr, target: $target:expr, $($debug_params:tt)* ) => (
+        if $enable_debug {
+            debug!(target: $target, $( $debug_params )* );
+        }
+    );
+);
+
+type Vec2 = Vector2<f32>;
 type Vec3 = Vector3<f32>;
 type Mat4 = Matrix4<f32>;
 
@@ -30,6 +39,25 @@ fn compact_color(input: [f32; 4]) -> u32 {
     r + g + b + a
 }
 
+#[allow(clippy::many_single_char_names)]
+fn bary_coords(p: Vec3, [a, b, c]: [Vec3; 3]) -> [f32; 3] {
+    let v0 = b - a;
+    let v1 = c - a;
+    let v2 = p - a;
+
+    let d00 = v0.dot(v0);
+    let d01 = v0.dot(v1);
+    let d11 = v1.dot(v1);
+    let d20 = v2.dot(v0);
+    let d21 = v2.dot(v1);
+    let denom = d00 * d11 - d01 * d01;
+    let v = (d11 * d20 - d01 * d21) / denom;
+    let w = (d00 * d21 - d01 * d20) / denom;
+    let u = 1.0 - v - w;
+
+    [u, v, w]
+}
+
 struct Ray {
     origin: Vec3,
     direction: Vec3,
@@ -41,12 +69,53 @@ struct Light {
 
 struct Geometry {
     vertices: Vec<Vec3>,
+    uvs: Option<Vec<Vec2>>,
     indices: Vec<i32>,
     color: [f32; 4],
+    diffuse_texture_id: Option<u64>,
 }
 
+struct Texture {
+    id: u64,
+    image: DynamicImage,
+}
+
+struct TextureStorage {
+    textures: Vec<Texture>,
+}
+
+impl TextureStorage {
+    fn new() -> Self {
+        TextureStorage {
+            textures: Vec::new(),
+        }
+    }
+
+    fn load(&mut self, path: &str) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let image = image::open(path).unwrap();
+        let mut hasher = DefaultHasher::new();
+        Hash::hash(path, &mut hasher);
+        let id = hasher.finish();
+        self.textures.push(Texture { id, image });
+
+        id
+    }
+
+    fn fetch(&self, id: u64) -> Option<&DynamicImage> {
+        self.textures
+            .iter()
+            .find(|texture| texture.id == id)
+            .map(|tex| &tex.image)
+    }
+}
+
+#[derive(Debug)]
 struct Face {
     vertices: [Vec3; 3],
+    uvs: Option<[Vec2; 3]>,
     normal: Vec3,
     start_index: usize,
 }
@@ -76,16 +145,21 @@ impl Iterator for FaceIter<'_> {
         let indices_idx = (self.face_idx * 3) as usize;
         self.face_idx += 1;
         if indices_idx < geometry.indices.len() {
-            let index0 = geometry.indices[indices_idx];
-            let index1 = geometry.indices[indices_idx + 1];
-            let index2 = geometry.indices[indices_idx + 2];
-            let v0 = geometry.vertices[index0 as usize];
-            let v1 = geometry.vertices[index1 as usize];
-            let v2 = geometry.vertices[index2 as usize];
+            let index0 = geometry.indices[indices_idx] as usize;
+            let index1 = geometry.indices[indices_idx + 1] as usize;
+            let index2 = geometry.indices[indices_idx + 2] as usize;
+            let v0 = geometry.vertices[index0];
+            let v1 = geometry.vertices[index1];
+            let v2 = geometry.vertices[index2];
+            let uvs = geometry
+                .uvs
+                .as_ref()
+                .map(|uvs| [uvs[index0], uvs[index1], uvs[index2]]);
             let vertices = [v0, v1, v2];
             let normal = calc_normal(&vertices);
             Some(Face {
                 vertices,
+                uvs,
                 normal,
                 start_index: indices_idx,
             })
@@ -114,35 +188,106 @@ struct Camera {
 struct Scene {
     camera: Camera,
     geometries: Vec<Geometry>,
+    ambient_light: [f32; 3],
     lights: Vec<Light>,
+    texture_storage: TextureStorage,
 }
 
 struct RenderSettings {
     resolution: (u32, u32),
     background_color: u32,
+    debug_coord: Option<(u32, u32)>,
 }
 
-fn create_cube() -> Geometry {
+fn create_cube(diffuse_texture_id: Option<u64>) -> Geometry {
     let vertices = vec![
+        vec3(-1.0, 1.0, -1.0),
+        vec3(1.0, 1.0, 1.0),
+        vec3(1.0, 1.0, -1.0),
+        vec3(1.0, 1.0, 1.0),
+        vec3(-1.0, -1.0, 1.0),
+        vec3(1.0, -1.0, 1.0),
+        vec3(-1.0, 1.0, 1.0),
         vec3(-1.0, -1.0, -1.0),
         vec3(-1.0, -1.0, 1.0),
+        vec3(1.0, -1.0, -1.0),
+        vec3(-1.0, -1.0, 1.0),
+        vec3(-1.0, -1.0, -1.0),
+        vec3(1.0, 1.0, -1.0),
         vec3(1.0, -1.0, 1.0),
         vec3(1.0, -1.0, -1.0),
         vec3(-1.0, 1.0, -1.0),
+        vec3(1.0, -1.0, -1.0),
+        vec3(-1.0, -1.0, -1.0),
+        vec3(-1.0, 1.0, -1.0),
         vec3(-1.0, 1.0, 1.0),
         vec3(1.0, 1.0, 1.0),
+        vec3(1.0, 1.0, 1.0),
+        vec3(-1.0, 1.0, 1.0),
+        vec3(-1.0, -1.0, 1.0),
+        vec3(-1.0, 1.0, 1.0),
+        vec3(-1.0, 1.0, -1.0),
+        vec3(-1.0, -1.0, -1.0),
+        vec3(1.0, -1.0, -1.0),
+        vec3(1.0, -1.0, 1.0),
+        vec3(-1.0, -1.0, 1.0),
         vec3(1.0, 1.0, -1.0),
+        vec3(1.0, 1.0, 1.0),
+        vec3(1.0, -1.0, 1.0),
+        vec3(-1.0, 1.0, -1.0),
+        vec3(1.0, 1.0, -1.0),
+        vec3(1.0, -1.0, -1.0),
     ];
 
-    let indices = vec![
-        0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7, 0, 4, 7, 0, 7, 3, 1, 5, 4, 1, 4, 0, 2, 6, 5, 2, 5, 1,
-        2, 6, 7, 2, 7, 3,
+    let uvs = vec![
+        vec2(0.625, 0.0),
+        vec2(0.375, 0.25),
+        vec2(0.375, 0.0),
+        vec2(0.625, 0.25),
+        vec2(0.375, 0.5),
+        vec2(0.375, 0.25),
+        vec2(0.625, 0.5),
+        vec2(0.375, 0.75),
+        vec2(0.375, 0.5),
+        vec2(0.625, 0.75),
+        vec2(0.375, 1.0),
+        vec2(0.375, 0.75),
+        vec2(0.375, 0.5),
+        vec2(0.125, 0.75),
+        vec2(0.125, 0.5),
+        vec2(0.875, 0.5),
+        vec2(0.625, 0.75),
+        vec2(0.625, 0.5),
+        vec2(0.625, 0.0),
+        vec2(0.625, 0.25),
+        vec2(0.375, 0.25),
+        vec2(0.625, 0.25),
+        vec2(0.625, 0.5),
+        vec2(0.375, 0.5),
+        vec2(0.625, 0.5),
+        vec2(0.625, 0.75),
+        vec2(0.375, 0.75),
+        vec2(0.625, 0.75),
+        vec2(0.625, 1.0),
+        vec2(0.375, 1.0),
+        vec2(0.375, 0.5),
+        vec2(0.375, 0.75),
+        vec2(0.125, 0.75),
+        vec2(0.875, 0.5),
+        vec2(0.875, 0.75),
+        vec2(0.625, 0.75),
     ];
+
+    let uvs = Some(uvs);
+
+    let indices = (0..36).collect();
 
     Geometry {
         vertices,
+        uvs,
         indices,
         color: [1.0, 0.0, 0.0, 1.0],
+        diffuse_texture_id,
     }
 }
 
@@ -153,6 +298,8 @@ fn create_scene() -> Scene {
         vec3(0.0, 1.0, 0.0),
     );
     let projection = perspective(Deg(75.0), 1.0, NEAR_PLANE, FAR_PLANE);
+    let mut texture_storage = TextureStorage::new();
+    let diffuse_texture_id = texture_storage.load("test.png");
 
     Scene {
         camera: Camera {
@@ -161,14 +308,19 @@ fn create_scene() -> Scene {
             ortho_width: 5.0f32,
             ortho_height: 5.0f32,
         },
-        geometries: vec![create_cube()],
+        geometries: vec![create_cube(Some(diffuse_texture_id))],
+        ambient_light: [0.2, 0.2, 0.2],
         lights: vec![Light {
             position: vec3(1.0, 1.0, -1.2),
         }],
+        texture_storage,
     }
 }
 
-fn intersect(ray: &Ray, face: &Face, view: &Mat4) -> Option<(f32, Vec3)> {
+// FIXME: take pre-transformed vertices instead of a face
+// OR
+// Take in the ray and faces in WORLD coordinates
+fn intersect(ray: &Ray, face: &Face, view: &Mat4, debug: bool) -> Option<(f32, Vec3)> {
     const TAG: &str = "intersection";
 
     let Ray { origin, direction } = ray;
@@ -181,7 +333,8 @@ fn intersect(ray: &Ray, face: &Face, view: &Mat4) -> Option<(f32, Vec3)> {
     let (v0, v1, v2) = (view * v0, view * v1, view * v2);
     let (v0, v1, v2) = (v0.xyz(), v1.xyz(), v2.xyz());
 
-    debug!(
+    debug_if!(
+        debug,
         target: TAG,
         "Intersect test:\nRay origin={:?} & direction={:?}\nv0={:?}\nv1={:?}\nv2={:?}",
         origin,
@@ -197,7 +350,7 @@ fn intersect(ray: &Ray, face: &Face, view: &Mat4) -> Option<(f32, Vec3)> {
 
     let normal_dot_ray_dir = normal.dot(*direction);
     if normal_dot_ray_dir.abs() < core::f32::EPSILON {
-        debug!(target: TAG, "1 parallel");
+        debug_if!(debug, target: TAG, "1 parallel");
         return None;
     }
 
@@ -205,7 +358,7 @@ fn intersect(ray: &Ray, face: &Face, view: &Mat4) -> Option<(f32, Vec3)> {
 
     let t = (normal.dot(*origin) + d) / normal_dot_ray_dir;
     if t < 0.0 {
-        debug!(target: TAG, "2 triangle behind t={}", t);
+        debug_if!(debug, target: TAG, "2 triangle behind t={}", t);
         return None;
     }
 
@@ -215,7 +368,7 @@ fn intersect(ray: &Ray, face: &Face, view: &Mat4) -> Option<(f32, Vec3)> {
     let vp0 = p - v0;
     let c = edge0.cross(vp0);
     if normal.dot(c) < 0.0 {
-        debug!(target: TAG, "3 P on right of edge0");
+        debug_if!(debug, target: TAG, "3 P on right of edge0");
         return None;
     }
 
@@ -223,7 +376,7 @@ fn intersect(ray: &Ray, face: &Face, view: &Mat4) -> Option<(f32, Vec3)> {
     let vp1 = p - v1;
     let c = edge1.cross(vp1);
     if normal.dot(c) < 0.0 {
-        debug!(target: TAG, "4 P on right of edge1");
+        debug_if!(debug, target: TAG, "4 P on right of edge1");
         return None;
     }
 
@@ -231,36 +384,70 @@ fn intersect(ray: &Ray, face: &Face, view: &Mat4) -> Option<(f32, Vec3)> {
     let vp2 = p - v2;
     let c = edge2.cross(vp2);
     if normal.dot(c) < 0.0 {
-        debug!(target: TAG, "5 P on right of edge2");
+        debug_if!(debug, target: TAG, "5 P on right of edge2");
         return None;
     }
 
     Some((t, p))
 }
 
-fn trace(scene: &Scene, ray: &Ray, background_color: u32) -> u32 {
+#[allow(clippy::many_single_char_names)]
+fn sample(
+    hit_point: Vec3,     // in view space
+    vertices: [Vec3; 3], // in view space
+    [uv0, uv1, uv2]: [Vec2; 3],
+    image: &DynamicImage,
+    debug: bool,
+) -> [f32; 4] {
+    let [b0, b1, b2] = bary_coords(hit_point, vertices);
+
+    let uv = (b0 * uv0) + (b1 * uv1) + (b2 * uv2);
+
+    debug_if!(debug, target: "sample", "uv0={:?} uv1={:?} uv1={:?}", uv0, uv1, uv2);
+    debug_if!(debug, target: "sample", "sample: vertices={:?} hit={:?} bary={} {} {} uv={:?}", vertices, hit_point, b0, b1, b2, uv);
+
+    let (width, height) = image.dimensions();
+    let (width, height) = (width as f32, height as f32);
+    let (x, y) = (width * uv.x, height * uv.y);
+    let (x, y) = (x.min(width - 1.0).max(0.0), y.min(height - 1.0).max(0.0));
+    let y = height - y;
+    let (x, y) = (x as u32, y as u32);
+    let pixel = image.get_pixel(x, y);
+
+    let channels = pixel.channels();
+    let (r, g, b, a) = (channels[0], channels[1], channels[2], channels[3]);
+    let (r, g, b, a) = (f32::from(r), f32::from(g), f32::from(b), f32::from(a));
+    let (r, g, b, a) = (r / 255.0, g / 255.0, b / 255.0, a / 255.0);
+
+    debug_if!(debug, target: "samplecolor", "sampled color is {:?}", (r, g, b, a));
+
+    [r as f32, g as f32, b as f32, a as f32]
+}
+
+// TODO:
+// Split the tracing and shading into two distinct steps.
+// trace can return a buffer of geomtries and face ids
+// and then the shading can be done all at once in a different function.
+fn trace(scene: &Scene, ray: &Ray, background_color: u32, debug: bool) -> u32 {
     let mut hit_dist = FAR_PLANE + 1.0f32;
     let mut hit_point = vec3(0.0f32, 0.0f32, 0.0f32);
     let mut hit_geom_idx = 0;
-    let mut hit_start_idx = 0;
-    let mut face_normal = vec3(0.0f32, 0.0f32, 0.0f32);
+    let mut hit_face = None;
 
     for (geom_idx, geom) in scene.geometries.iter().enumerate() {
         for face in geom.face_iter() {
-            if let Some((dist, p)) = intersect(&ray, &face, &scene.camera.view) {
+            if let Some((dist, p)) = intersect(&ray, &face, &scene.camera.view, debug) {
                 if dist < hit_dist {
                     hit_dist = dist;
                     hit_point = p;
                     hit_geom_idx = geom_idx;
-                    hit_start_idx = face.start_index;
-                    face_normal = face.normal;
+                    hit_face = Some(face);
                 }
             }
         }
     }
 
-    if hit_dist < FAR_PLANE {
-        debug!(target: "hitidx", "Hit vertex index: {} raydir={:?}", hit_start_idx, ray.direction);
+    if let Some(face) = hit_face {
         (&scene.lights)
             .iter()
             .map(|light| {
@@ -268,29 +455,45 @@ fn trace(scene: &Scene, ray: &Ray, background_color: u32) -> u32 {
                 let light_pos = light_pos.xyz();
                 let hit_to_light = hit_point - light_pos;
                 let hit_to_light = hit_to_light.normalize();
-                let angle = hit_to_light.angle(face_normal);
+                let angle = hit_to_light.angle(face.normal);
                 let shade = angle.cos();
-                debug!(target: "shade", "shade={} P={:?} angle={:?} light={:?} raydir={:?}", shade, hit_point, angle, light_pos, ray.direction);
+                debug_if!(debug, target: "shade", "shade={} P={:?} angle={:?} light={:?} raydir={:?}", shade, hit_point, angle, light_pos, ray.direction);
 
-                let diffuse_color = scene.geometries[hit_geom_idx].color;
+                debug_if!(debug, target: "shade", "FACE={:?}", face);
+
+                let geometry = &scene.geometries[hit_geom_idx];
+
+                let texture_id = geometry.diffuse_texture_id;
+                let image = texture_id.and_then(|texture_id| {
+                    scene.texture_storage.fetch(texture_id)
+                });
+
+                let diffuse_color =
+                    match (image, face.uvs) {
+                        (Some(image), Some(uvs)) => {
+                            let view = scene.camera.view;
+                            let verts = [
+                                (view * face.vertices[0].extend(1.0)).xyz(),
+                                (view * face.vertices[1].extend(1.0)).xyz(),
+                                (view * face.vertices[2].extend(1.0)).xyz(),
+                            ];
+                            sample(hit_point, verts, uvs, &image, debug)
+                        },
+                        _ => {
+                            geometry.color
+                        }
+                    };
+
+                let ambient_light = scene.ambient_light;
 
                 let final_color = [
-                    diffuse_color[0] * shade,
-                    diffuse_color[1] * shade,
-                    diffuse_color[2] * shade,
+                    (ambient_light[0] + diffuse_color[0]) + (diffuse_color[0] * shade),
+                    (ambient_light[1] + diffuse_color[1]) + (diffuse_color[1] * shade),
+                    (ambient_light[2] + diffuse_color[2]) + (diffuse_color[2] * shade),
                     diffuse_color[3],
                 ];
 
-                debug!(target: "shade", "color={}", final_color[0]);
-                debug!(target: "shade", "color={}", final_color[1]);
-                debug!(target: "shade", "color={}", final_color[2]);
-                debug!(target: "shade", "color={}", final_color[3]);
-
-                let final_color = compact_color(final_color);
-
-                debug!(target: "shade", "color={}", final_color);
-
-                final_color
+                compact_color(final_color)
             })
             .sum()
     } else {
@@ -304,6 +507,10 @@ fn render(scene: &Scene, render_settings: &RenderSettings) -> ImageBuffer<image:
     let ortho_height = scene.camera.ortho_height;
 
     ImageBuffer::from_fn(res_w, res_h, |x, y| {
+        let debug = render_settings
+            .debug_coord
+            .map_or(false, |coord| coord.0 == x && coord.1 == y);
+
         let x = x as f32;
         let y = y as f32;
         let res_w = res_w as f32;
@@ -319,13 +526,13 @@ fn render(scene: &Scene, render_settings: &RenderSettings) -> ImageBuffer<image:
         );
         let inverse_projection = scene.camera.projection.inverse_transform().unwrap();
         let ray_direction = inverse_projection * ray_direction;
-        debug!(target: "ray", "ray: {:?}", ray_direction);
+        debug_if!(debug, target: "ray", "ray: {:?}", ray_direction);
 
         let ray = Ray {
             origin: ray_origin,
             direction: ray_direction.xyz(),
         };
-        let color = trace(&scene, &ray, render_settings.background_color);
+        let color = trace(&scene, &ray, render_settings.background_color, debug);
         let red = (color & 0xFF_00_00_00) >> 24;
         let green = (color & 0x00_FF_00_00) >> 16;
         let blue = (color & 0x00_00_FF_00) >> 8;
@@ -333,7 +540,7 @@ fn render(scene: &Scene, render_settings: &RenderSettings) -> ImageBuffer<image:
     })
 }
 
-fn interactive_loop(scene: &mut Scene, render_settings: &RenderSettings) {
+fn interactive_loop(scene: &mut Scene, render_settings: &mut RenderSettings) {
     let sdl_context = sdl2::init().unwrap();
     let video_subsystem = sdl_context.video().unwrap();
 
@@ -384,22 +591,25 @@ fn interactive_loop(scene: &mut Scene, render_settings: &RenderSettings) {
                 }
                 Event::MouseButtonDown {
                     mouse_btn: MouseButton::Left,
+                    x,
+                    y,
                     ..
-                } => {
+                } if x > 0 && y > 0 && x < res_w as i32 && y < res_h as i32 => {
                     mouse_down = true;
+                    needs_redraw = true;
+                    render_settings.debug_coord = Some((x as u32, y as u32));
                 }
                 Event::MouseButtonUp {
                     mouse_btn: MouseButton::Left,
                     ..
                 } => {
                     mouse_down = false;
+                    render_settings.debug_coord = None;
                 }
-                Event::MouseMotion { xrel, yrel, .. } => {
-                    if mouse_down {
-                        yaw -= Rad((xrel as f32) * 0.008);
-                        pitch += Rad((yrel as f32) * 0.008);
-                        needs_redraw = true;
-                    }
+                Event::MouseMotion { xrel, yrel, .. } if mouse_down => {
+                    yaw -= Rad((xrel as f32) * 0.008);
+                    pitch += Rad((yrel as f32) * 0.008);
+                    needs_redraw = true;
                 }
                 _ => {}
             }
@@ -442,15 +652,16 @@ fn main() {
     env_logger::init();
 
     let mut scene = create_scene();
-    let render_settings = RenderSettings {
+    let mut render_settings = RenderSettings {
         resolution: (640, 480),
         background_color: 0,
+        debug_coord: None,
     };
 
     let interactive_mode = std::env::args().any(|arg| arg == "--interactive");
 
     if interactive_mode {
-        interactive_loop(&mut scene, &render_settings);
+        interactive_loop(&mut scene, &mut render_settings);
     } else {
         let imgbuf = render(&scene, &render_settings);
         imgbuf.save("image.png").unwrap();
