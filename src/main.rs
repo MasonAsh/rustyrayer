@@ -5,7 +5,8 @@ use cgmath::{
 use env_logger;
 use image;
 use image::{DynamicImage, GenericImageView, ImageBuffer, Pixel};
-use log::debug;
+use log::{debug, info};
+use rand;
 use sdl2;
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
@@ -58,6 +59,7 @@ fn bary_coords(p: Vec3, [a, b, c]: [Vec3; 3]) -> [f32; 3] {
     [u, v, w]
 }
 
+#[derive(Copy, Clone)]
 struct Ray {
     origin: Vec3,
     direction: Vec3,
@@ -68,11 +70,25 @@ struct Light {
 }
 
 struct Geometry {
+    id: u32,
     vertices: Vec<Vec3>,
     uvs: Option<Vec<Vec2>>,
     indices: Vec<i32>,
     color: [f32; 4],
     diffuse_texture_id: Option<u64>,
+}
+
+impl Default for Geometry {
+    fn default() -> Self {
+        Geometry {
+            id: rand::random(),
+            vertices: Vec::new(),
+            uvs: None,
+            indices: Vec::new(),
+            color: [0.0; 4],
+            diffuse_texture_id: None,
+        }
+    }
 }
 
 struct Texture {
@@ -193,6 +209,12 @@ struct Scene {
     texture_storage: TextureStorage,
 }
 
+impl Scene {
+    fn get_geometry(&self, id: u32) -> Option<&Geometry> {
+        self.geometries.iter().find(|geom| geom.id == id)
+    }
+}
+
 struct RenderSettings {
     resolution: (u32, u32),
     background_color: u32,
@@ -288,6 +310,7 @@ fn create_cube(diffuse_texture_id: Option<u64>) -> Geometry {
         indices,
         color: [1.0, 0.0, 0.0, 1.0],
         diffuse_texture_id,
+        ..Default::default()
     }
 }
 
@@ -424,44 +447,60 @@ fn sample(
     [r as f32, g as f32, b as f32, a as f32]
 }
 
-// TODO:
-// Split the tracing and shading into two distinct steps.
-// trace can return a buffer of geomtries and face ids
-// and then the shading can be done all at once in a different function.
-fn trace(scene: &Scene, ray: &Ray, background_color: u32, debug: bool) -> u32 {
+struct Hit {
+    face: Face,
+    geometry_id: u32,
+    point: Vec3,
+    //distance: f32,
+    ray: Ray,
+}
+
+fn trace(scene: &Scene, ray: &Ray, debug: bool) -> Option<Hit> {
     let mut hit_dist = FAR_PLANE + 1.0f32;
     let mut hit_point = vec3(0.0f32, 0.0f32, 0.0f32);
-    let mut hit_geom_idx = 0;
+    let mut hit_geom_id = 0;
     let mut hit_face = None;
 
-    for (geom_idx, geom) in scene.geometries.iter().enumerate() {
+    for geom in scene.geometries.iter() {
         for face in geom.face_iter() {
             if let Some((dist, p)) = intersect(&ray, &face, &scene.camera.view, debug) {
                 if dist < hit_dist {
                     hit_dist = dist;
                     hit_point = p;
-                    hit_geom_idx = geom_idx;
+                    hit_geom_id = geom.id;
                     hit_face = Some(face);
                 }
             }
         }
     }
 
-    if let Some(face) = hit_face {
+    hit_face.and_then(|face| {
+        Some(Hit {
+            face,
+            geometry_id: hit_geom_id,
+            point: hit_point,
+            //distance: hit_dist,
+            ray: *ray,
+        })
+    })
+}
+
+fn shade(scene: &Scene, hit: Option<&Hit>, background_color: u32, debug: bool) -> u32 {
+    if let Some(hit) = hit {
         (&scene.lights)
             .iter()
             .map(|light| {
                 let light_pos = scene.camera.view * light.position.extend(1.0);
                 let light_pos = light_pos.xyz();
-                let hit_to_light = hit_point - light_pos;
+                let hit_to_light = hit.point - light_pos;
                 let hit_to_light = hit_to_light.normalize();
-                let angle = hit_to_light.angle(face.normal);
+                let angle = hit_to_light.angle(hit.face.normal);
                 let shade = angle.cos();
-                debug_if!(debug, target: "shade", "shade={} P={:?} angle={:?} light={:?} raydir={:?}", shade, hit_point, angle, light_pos, ray.direction);
+                debug_if!(debug, target: "shade", "shade={} P={:?} angle={:?} light={:?} raydir={:?}", shade, hit.point, angle, light_pos, hit.ray.direction);
 
-                debug_if!(debug, target: "shade", "FACE={:?}", face);
+                debug_if!(debug, target: "shade", "FACE={:?}", hit.face);
 
-                let geometry = &scene.geometries[hit_geom_idx];
+                let geometry = &scene.get_geometry(hit.geometry_id).unwrap();
 
                 let texture_id = geometry.diffuse_texture_id;
                 let image = texture_id.and_then(|texture_id| {
@@ -469,15 +508,15 @@ fn trace(scene: &Scene, ray: &Ray, background_color: u32, debug: bool) -> u32 {
                 });
 
                 let diffuse_color =
-                    match (image, face.uvs) {
+                    match (image, hit.face.uvs) {
                         (Some(image), Some(uvs)) => {
                             let view = scene.camera.view;
                             let verts = [
-                                (view * face.vertices[0].extend(1.0)).xyz(),
-                                (view * face.vertices[1].extend(1.0)).xyz(),
-                                (view * face.vertices[2].extend(1.0)).xyz(),
+                                (view * hit.face.vertices[0].extend(1.0)).xyz(),
+                                (view * hit.face.vertices[1].extend(1.0)).xyz(),
+                                (view * hit.face.vertices[2].extend(1.0)).xyz(),
                             ];
-                            sample(hit_point, verts, uvs, &image, debug)
+                            sample(hit.point, verts, uvs, &image, debug)
                         },
                         _ => {
                             geometry.color
@@ -506,7 +545,9 @@ fn render(scene: &Scene, render_settings: &RenderSettings) -> ImageBuffer<image:
     let ortho_width = scene.camera.ortho_width;
     let ortho_height = scene.camera.ortho_height;
 
-    ImageBuffer::from_fn(res_w, res_h, |x, y| {
+    let begin = std::time::Instant::now();
+
+    let imgbuf = ImageBuffer::from_fn(res_w, res_h, |x, y| {
         let debug = render_settings
             .debug_coord
             .map_or(false, |coord| coord.0 == x && coord.1 == y);
@@ -532,12 +573,25 @@ fn render(scene: &Scene, render_settings: &RenderSettings) -> ImageBuffer<image:
             origin: ray_origin,
             direction: ray_direction.xyz(),
         };
-        let color = trace(&scene, &ray, render_settings.background_color, debug);
+        let hit = trace(&scene, &ray, debug);
+        let color = shade(
+            &scene,
+            hit.as_ref(),
+            render_settings.background_color,
+            debug,
+        );
         let red = (color & 0xFF_00_00_00) >> 24;
         let green = (color & 0x00_FF_00_00) >> 16;
         let blue = (color & 0x00_00_FF_00) >> 8;
         image::Rgb([red as u8, green as u8, blue as u8])
-    })
+    });
+
+    let end = std::time::Instant::now();
+    let elapsed = end.duration_since(begin);
+
+    info!(target: "perf", "Render finished in {}s{}ms", elapsed.as_secs(), elapsed.subsec_millis());
+
+    imgbuf
 }
 
 fn interactive_loop(scene: &mut Scene, render_settings: &mut RenderSettings) {
