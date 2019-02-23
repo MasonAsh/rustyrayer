@@ -1,6 +1,6 @@
 use cgmath::{
-    perspective, vec2, vec3, vec4, Angle, Deg, EuclideanSpace, InnerSpace, Matrix4, Point3,
-    Quaternion, Rad, Rotation3, Transform, Vector2, Vector3,
+    perspective, vec2, vec3, vec4, Angle, Array, Deg, EuclideanSpace, InnerSpace, Matrix4, Point3,
+    Quaternion, Rad, Rotation, Rotation3, Transform, Vector2, Vector3, Zero,
 };
 use env_logger;
 use image;
@@ -40,6 +40,10 @@ fn compact_color(input: [f32; 4]) -> u32 {
     r + g + b + a
 }
 
+fn transform_vec3(transform: &Mat4, vec: &Vec3) -> Vec3 {
+    (transform * vec.extend(1.0)).xyz()
+}
+
 #[allow(clippy::many_single_char_names)]
 fn bary_coords(p: Vec3, [a, b, c]: [Vec3; 3]) -> [f32; 3] {
     let v0 = b - a;
@@ -63,10 +67,60 @@ fn bary_coords(p: Vec3, [a, b, c]: [Vec3; 3]) -> [f32; 3] {
 struct Ray {
     origin: Vec3,
     direction: Vec3,
+    inv_dir: Vec3,
+    inv_dir_sign: [usize; 3],
+}
+
+impl Ray {
+    fn new(origin: Vec3, direction: Vec3) -> Ray {
+        let inv_dir = 1.0 / direction;
+        // This is a precomputation of the signs to optimize intersect_aabb
+        let inv_dir_sign = [
+            if inv_dir.x < 0.0 { 1 } else { 0 },
+            if inv_dir.y < 0.0 { 1 } else { 0 },
+            if inv_dir.z < 0.0 { 1 } else { 0 },
+        ];
+
+        Ray {
+            origin,
+            direction,
+            inv_dir,
+            inv_dir_sign,
+        }
+    }
 }
 
 struct Light {
     position: Vec3,
+}
+
+struct AABB {
+    bounds: [Vec3; 2],
+}
+
+impl AABB {
+    fn min(&self) -> &Vec3 {
+        &self.bounds[0]
+    }
+
+    fn max(&self) -> &Vec3 {
+        &self.bounds[1]
+    }
+}
+
+fn aabb(points: &[Vec3]) -> AABB {
+    let infinite = Vec3::from_value(core::f32::INFINITY);
+    let min = points.iter().fold(infinite, |acc, &point| {
+        vec3(acc.x.min(point.x), acc.y.min(point.y), acc.z.min(point.z))
+    });
+
+    let max = points.iter().fold(Vec3::zero(), |acc, &point| {
+        vec3(acc.x.max(point.x), acc.y.max(point.y), acc.z.max(point.z))
+    });
+
+    debug!(target: "bb", "min {:?} max {:?}", min, max);
+
+    AABB { bounds: [min, max] }
 }
 
 struct Geometry {
@@ -76,6 +130,7 @@ struct Geometry {
     indices: Vec<i32>,
     color: [f32; 4],
     diffuse_texture_id: Option<u64>,
+    bounding_box: AABB,
 }
 
 impl Default for Geometry {
@@ -87,6 +142,9 @@ impl Default for Geometry {
             indices: Vec::new(),
             color: [0.0; 4],
             diffuse_texture_id: None,
+            bounding_box: AABB {
+                bounds: [Vec3::zero(), Vec3::zero()],
+            },
         }
     }
 }
@@ -301,8 +359,8 @@ fn create_cube(diffuse_texture_id: Option<u64>) -> Geometry {
     ];
 
     let uvs = Some(uvs);
-
     let indices = (0..36).collect();
+    let bounding_box = aabb(&vertices);
 
     Geometry {
         vertices,
@@ -310,6 +368,7 @@ fn create_cube(diffuse_texture_id: Option<u64>) -> Geometry {
         indices,
         color: [1.0, 0.0, 0.0, 1.0],
         diffuse_texture_id,
+        bounding_box,
         ..Default::default()
     }
 }
@@ -346,7 +405,9 @@ fn create_scene() -> Scene {
 fn intersect(ray: &Ray, face: &Face, view: &Mat4, debug: bool) -> Option<(f32, Vec3)> {
     const TAG: &str = "intersection";
 
-    let Ray { origin, direction } = ray;
+    let Ray {
+        origin, direction, ..
+    } = ray;
     let Face {
         vertices, /*normal,*/
         ..
@@ -414,6 +475,87 @@ fn intersect(ray: &Ray, face: &Face, view: &Mat4, debug: bool) -> Option<(f32, V
     Some((t, p))
 }
 
+fn min_vec3(a: &Vec3, b: &Vec3) -> Vec3 {
+    vec3(a.x.min(b.x), a.y.min(b.y), a.z.min(b.z))
+}
+
+fn max_vec3(a: &Vec3, b: &Vec3) -> Vec3 {
+    vec3(a.x.max(b.x), a.y.max(b.y), a.z.max(b.z))
+}
+
+fn transform_aabb(transform: &Mat4, bb: &AABB) -> AABB {
+    let right = transform.x;
+    let up = transform.y;
+    let back = transform.z;
+    let xa = right * bb.min().x;
+    let xb = right * bb.max().x;
+    let ya = up * bb.min().y;
+    let yb = up * bb.max().y;
+    let za = back * bb.min().z;
+    let zb = back * bb.max().z;
+
+    let xa = xa.xyz();
+    let xb = xb.xyz();
+    let ya = ya.xyz();
+    let yb = yb.xyz();
+    let za = za.xyz();
+    let zb = zb.xyz();
+
+    let min = min_vec3(&xa, &xb) + min_vec3(&ya, &yb) + min_vec3(&za, &zb);
+    let max = max_vec3(&xa, &xb) + max_vec3(&ya, &yb) + max_vec3(&za, &zb);
+    AABB { bounds: [min, max] }
+}
+
+fn transform_dir(transform: &Mat4, dir: &Vec3) -> Vec3 {
+    use cgmath::Matrix3;
+    let rot = Matrix3::from_cols(transform.x.xyz(), transform.y.xyz(), transform.z.xyz());
+
+    let rot: Quaternion<f32> = rot.into();
+
+    let res = rot.rotate_vector(*dir);
+
+    vec3(res.x, res.y, res.z)
+}
+
+fn intersect_aabb(ray: &Ray, bb: &AABB, view: &Mat4) -> bool {
+    // TODO: need to decide whether rays should be in world space or view space and stick to that.
+    // we're transforming the ray into world space here.
+    let ray = Ray::new(
+        transform_vec3(&view.inverse_transform().unwrap(), &ray.origin),
+        transform_dir(&view.inverse_transform().unwrap(), &ray.direction),
+    );
+
+    let Ray {
+        origin,
+        inv_dir,
+        inv_dir_sign,
+        ..
+    } = ray;
+
+    let bb = transform_aabb(view, bb);
+
+    let tmin = (bb.bounds[inv_dir_sign[0]].x - origin.x) * inv_dir.x;
+    let tmax = (bb.bounds[1 - inv_dir_sign[0]].x - origin.x) * inv_dir.x;
+
+    let tymin = (bb.bounds[inv_dir_sign[1]].y - origin.y) * inv_dir.y;
+    let tymax = (bb.bounds[1 - inv_dir_sign[1]].y - origin.y) * inv_dir.y;
+
+    if tmin > tymax || tymin > tmax {
+        return false;
+    }
+
+    let (tmin, tmax) = (tmin.max(tymin), tmax.min(tymax));
+
+    let tzmin = (bb.bounds[inv_dir_sign[2]].z - origin.z) * inv_dir.z;
+    let tzmax = (bb.bounds[1 - inv_dir_sign[2]].z - origin.z) * inv_dir.z;
+
+    if tmin > tzmax || tzmin > tmax {
+        return false;
+    }
+
+    true
+}
+
 #[allow(clippy::many_single_char_names)]
 fn sample(
     hit_point: Vec3,     // in view space
@@ -432,8 +574,8 @@ fn sample(
     let (width, height) = image.dimensions();
     let (width, height) = (width as f32, height as f32);
     let (x, y) = (width * uv.x, height * uv.y);
-    let (x, y) = (x.min(width - 1.0).max(0.0), y.min(height - 1.0).max(0.0));
     let y = height - y;
+    let (x, y) = (x.min(width - 1.0).max(0.0), y.min(height - 1.0).max(0.0));
     let (x, y) = (x as u32, y as u32);
     let pixel = image.get_pixel(x, y);
 
@@ -462,6 +604,12 @@ fn trace(scene: &Scene, ray: &Ray, debug: bool) -> Option<Hit> {
     let mut hit_face = None;
 
     for geom in scene.geometries.iter() {
+        let hit_bounding_box = intersect_aabb(&ray, &geom.bounding_box, &scene.camera.view);
+        debug_if!(debug, target: "intersect_aabb", "AABB intersect: {}", hit_bounding_box);
+        if !hit_bounding_box {
+            continue;
+        }
+
         for face in geom.face_iter() {
             if let Some((dist, p)) = intersect(&ray, &face, &scene.camera.view, debug) {
                 if dist < hit_dist {
@@ -540,50 +688,57 @@ fn shade(scene: &Scene, hit: Option<&Hit>, background_color: u32, debug: bool) -
     }
 }
 
-fn render(scene: &Scene, render_settings: &RenderSettings) -> ImageBuffer<image::Rgb<u8>, Vec<u8>> {
+fn render_one_pixel(
+    (x, y): (u32, u32),
+    scene: &Scene,
+    render_settings: &RenderSettings,
+) -> image::Rgb<u8> {
     let (res_w, res_h) = render_settings.resolution;
     let ortho_width = scene.camera.ortho_width;
     let ortho_height = scene.camera.ortho_height;
 
+    let debug = render_settings
+        .debug_coord
+        .map_or(false, |coord| coord.0 == x && coord.1 == y);
+
+    let x = x as f32;
+    let y = y as f32;
+    let res_w = res_w as f32;
+    let res_h = res_h as f32;
+    let ortho_x = -(x / res_w) * ortho_width + (ortho_width / 2.0);
+    let ortho_y = (y / res_h) * ortho_height - (ortho_height / 2.0);
+    let ray_origin = vec3(0.0, 0.0, 0.0f32);
+    let ray_direction = vec4(
+        ortho_x / ortho_width,
+        ortho_y / ortho_height,
+        0.0f32,
+        1.0f32,
+    );
+    let inverse_projection = scene.camera.projection.inverse_transform().unwrap();
+    let ray_direction = inverse_projection * ray_direction;
+    debug_if!(debug, target: "ray", "ray: {:?}", ray_direction);
+
+    let ray = Ray::new(ray_origin, ray_direction.xyz());
+    let hit = trace(&scene, &ray, debug);
+    let color = shade(
+        &scene,
+        hit.as_ref(),
+        render_settings.background_color,
+        debug,
+    );
+    let red = (color & 0xFF_00_00_00) >> 24;
+    let green = (color & 0x00_FF_00_00) >> 16;
+    let blue = (color & 0x00_00_FF_00) >> 8;
+    image::Rgb([red as u8, green as u8, blue as u8])
+}
+
+fn render(scene: &Scene, render_settings: &RenderSettings) -> ImageBuffer<image::Rgb<u8>, Vec<u8>> {
+    let (res_w, res_h) = render_settings.resolution;
+
     let begin = std::time::Instant::now();
 
     let imgbuf = ImageBuffer::from_fn(res_w, res_h, |x, y| {
-        let debug = render_settings
-            .debug_coord
-            .map_or(false, |coord| coord.0 == x && coord.1 == y);
-
-        let x = x as f32;
-        let y = y as f32;
-        let res_w = res_w as f32;
-        let res_h = res_h as f32;
-        let ortho_x = -(x / res_w) * ortho_width + (ortho_width / 2.0);
-        let ortho_y = (y / res_h) * ortho_height - (ortho_height / 2.0);
-        let ray_origin = vec3(0.0, 0.0, 0.0f32);
-        let ray_direction = vec4(
-            ortho_x / ortho_width,
-            ortho_y / ortho_height,
-            0.0f32,
-            1.0f32,
-        );
-        let inverse_projection = scene.camera.projection.inverse_transform().unwrap();
-        let ray_direction = inverse_projection * ray_direction;
-        debug_if!(debug, target: "ray", "ray: {:?}", ray_direction);
-
-        let ray = Ray {
-            origin: ray_origin,
-            direction: ray_direction.xyz(),
-        };
-        let hit = trace(&scene, &ray, debug);
-        let color = shade(
-            &scene,
-            hit.as_ref(),
-            render_settings.background_color,
-            debug,
-        );
-        let red = (color & 0xFF_00_00_00) >> 24;
-        let green = (color & 0x00_FF_00_00) >> 16;
-        let blue = (color & 0x00_00_FF_00) >> 8;
-        image::Rgb([red as u8, green as u8, blue as u8])
+        render_one_pixel((x, y), scene, render_settings)
     });
 
     let end = std::time::Instant::now();
@@ -624,6 +779,7 @@ fn interactive_loop(scene: &mut Scene, render_settings: &mut RenderSettings) {
     let mut orbit_dist = 5.0f32;
     let mut yaw = Rad(0.0f32);
     let mut pitch = Rad(0.0f32);
+    let mut cam_offset = Vec3::zero();
 
     'running: loop {
         for event in event_pump.poll_iter() {
@@ -652,6 +808,7 @@ fn interactive_loop(scene: &mut Scene, render_settings: &mut RenderSettings) {
                     mouse_down = true;
                     needs_redraw = true;
                     render_settings.debug_coord = Some((x as u32, y as u32));
+                    info!(target: "dbgcoord", "dbgcoord {} {}", x, y);
                 }
                 Event::MouseButtonUp {
                     mouse_btn: MouseButton::Left,
@@ -665,6 +822,20 @@ fn interactive_loop(scene: &mut Scene, render_settings: &mut RenderSettings) {
                     pitch += Rad((yrel as f32) * 0.008);
                     needs_redraw = true;
                 }
+                Event::KeyDown {
+                    keycode: Some(Keycode::A),
+                    ..
+                } => {
+                    needs_redraw = true;
+                    cam_offset.x -= 1.0;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::D),
+                    ..
+                } => {
+                    needs_redraw = true;
+                    cam_offset.x += 1.0;
+                }
                 _ => {}
             }
         }
@@ -673,14 +844,15 @@ fn interactive_loop(scene: &mut Scene, render_settings: &mut RenderSettings) {
             // Orbit the camera with our yaw and pitch angles
             let camera_position = Quaternion::from_angle_y(-yaw)
                 * Quaternion::from_angle_x(pitch)
-                * vec3(0.0, 0.0, orbit_dist);
+                * vec3(0.0, 0.0, orbit_dist)
+                + cam_offset;
 
             // Mat4::look_at requires a Point3
             let camera_position = Point3::from_vec(camera_position);
 
             scene.camera.view = Mat4::look_at(
                 camera_position,
-                Point3::new(0.0, 0.0, 0.0),
+                Point3::from_vec(cam_offset),
                 vec3(0.0, 1.0, 0.0),
             );
 
@@ -706,16 +878,34 @@ fn main() {
     env_logger::init();
 
     let mut scene = create_scene();
+    let mut args_iter = std::env::args();
+    let single_debug_coord = args_iter.position(|arg| arg == "--sdc").and_then(|_| {
+        let debug_coord = args_iter.next();
+        debug_coord.and_then(|debug_coord| {
+            let split: Vec<_> = debug_coord.split(',').collect();
+            let map_str_number = |input: &&str| input.parse::<u32>().ok();
+            split.get(0).and_then(map_str_number).and_then(|val0| {
+                split
+                    .get(1)
+                    .and_then(map_str_number)
+                    .map(|val1| (val0, val1))
+            })
+        })
+    });
+
     let mut render_settings = RenderSettings {
         resolution: (640, 480),
         background_color: 0,
-        debug_coord: None,
+        debug_coord: single_debug_coord,
     };
 
     let interactive_mode = std::env::args().any(|arg| arg == "--interactive");
 
     if interactive_mode {
         interactive_loop(&mut scene, &mut render_settings);
+    } else if let Some(coord) = single_debug_coord {
+        let color = render_one_pixel(coord, &scene, &render_settings);
+        println!("Pixel color is {:?}", color);
     } else {
         let imgbuf = render(&scene, &render_settings);
         imgbuf.save("image.png").unwrap();
