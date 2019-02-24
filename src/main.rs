@@ -1,6 +1,6 @@
 use cgmath::{
     perspective, vec2, vec3, vec4, Angle, Array, Deg, EuclideanSpace, InnerSpace, Matrix4, Point3,
-    Quaternion, Rad, Rotation, Rotation3, Transform, Vector2, Vector3, Zero,
+    Quaternion, Rad, Rotation, Rotation3, SquareMatrix, Transform, Vector2, Vector3, Zero,
 };
 use env_logger;
 use image;
@@ -12,6 +12,7 @@ use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 use sdl2::mouse::MouseButton;
 use sdl2::pixels::PixelFormatEnum;
+use std::collections::HashMap;
 
 macro_rules! debug_if(
     ( $enable_debug:expr, target: $target:expr, $($debug_params:tt)* ) => (
@@ -40,7 +41,7 @@ fn compact_color(input: [f32; 4]) -> u32 {
     r + g + b + a
 }
 
-fn transform_vec3(transform: &Mat4, vec: &Vec3) -> Vec3 {
+fn transform_vec3(transform: Mat4, vec: Vec3) -> Vec3 {
     (transform * vec.extend(1.0)).xyz()
 }
 
@@ -130,7 +131,7 @@ struct Geometry {
     indices: Vec<i32>,
     color: [f32; 4],
     diffuse_texture_id: Option<u64>,
-    bounding_box: AABB,
+    transform: Mat4,
 }
 
 impl Default for Geometry {
@@ -142,9 +143,7 @@ impl Default for Geometry {
             indices: Vec::new(),
             color: [0.0; 4],
             diffuse_texture_id: None,
-            bounding_box: AABB {
-                bounds: [Vec3::zero(), Vec3::zero()],
-            },
+            transform: Mat4::identity(),
         }
     }
 }
@@ -196,6 +195,7 @@ struct Face {
 
 struct FaceIter<'a> {
     geometry: &'a Geometry,
+    cache: &'a SceneCache,
     face_idx: u32,
 }
 
@@ -214,17 +214,20 @@ impl Iterator for FaceIter<'_> {
             )
         }
 
-        let geometry = self.geometry;
+        let FaceIter {
+            cache, geometry, ..
+        } = self;
 
         let indices_idx = (self.face_idx * 3) as usize;
         self.face_idx += 1;
         if indices_idx < geometry.indices.len() {
+            let pretransformed_verts = &cache.world_space_verts[&geometry.id];
             let index0 = geometry.indices[indices_idx] as usize;
             let index1 = geometry.indices[indices_idx + 1] as usize;
             let index2 = geometry.indices[indices_idx + 2] as usize;
-            let v0 = geometry.vertices[index0];
-            let v1 = geometry.vertices[index1];
-            let v2 = geometry.vertices[index2];
+            let v0 = pretransformed_verts[index0];
+            let v1 = pretransformed_verts[index1];
+            let v2 = pretransformed_verts[index2];
             let uvs = geometry
                 .uvs
                 .as_ref()
@@ -244,9 +247,10 @@ impl Iterator for FaceIter<'_> {
 }
 
 impl Geometry {
-    fn face_iter(&self) -> FaceIter {
+    fn face_iter<'a>(&'a self, cache: &'a SceneCache) -> FaceIter<'a> {
         FaceIter {
             geometry: self,
+            cache,
             face_idx: 0,
         }
     }
@@ -270,6 +274,37 @@ struct Scene {
 impl Scene {
     fn get_geometry(&self, id: u32) -> Option<&Geometry> {
         self.geometries.iter().find(|geom| geom.id == id)
+    }
+}
+
+/// The Scene structure is intended to be a "pure" representation of the scene.
+/// SceneCache holds all the hot data that should be precomputed before a render.
+struct SceneCache {
+    world_space_verts: HashMap<u32, Vec<Vec3>>,
+    bounding_boxes: HashMap<u32, AABB>,
+}
+
+fn build_cache(scene: &Scene) -> SceneCache {
+    let world_space_verts: HashMap<u32, Vec<Vec3>> = scene
+        .geometries
+        .iter()
+        .map(|geom| {
+            let mut transformed_verts = Vec::with_capacity(geom.vertices.len());
+            for vert in geom.vertices.iter() {
+                transformed_verts.push(transform_vec3(geom.transform, *vert));
+            }
+            (geom.id, transformed_verts)
+        })
+        .collect();
+
+    let bounding_boxes: HashMap<u32, AABB> = world_space_verts
+        .iter()
+        .map(|(id, verts)| (*id, aabb(verts)))
+        .collect();
+
+    SceneCache {
+        world_space_verts,
+        bounding_boxes,
     }
 }
 
@@ -360,7 +395,7 @@ fn create_cube(diffuse_texture_id: Option<u64>) -> Geometry {
 
     let uvs = Some(uvs);
     let indices = (0..36).collect();
-    let bounding_box = aabb(&vertices);
+    let transform = Mat4::from_axis_angle(vec3(0.0, 1.0, 0.0), Deg(50.0));
 
     Geometry {
         vertices,
@@ -368,7 +403,7 @@ fn create_cube(diffuse_texture_id: Option<u64>) -> Geometry {
         indices,
         color: [1.0, 0.0, 0.0, 1.0],
         diffuse_texture_id,
-        bounding_box,
+        transform,
         ..Default::default()
     }
 }
@@ -399,9 +434,6 @@ fn create_scene() -> Scene {
     }
 }
 
-// FIXME: take pre-transformed vertices instead of a face
-// OR
-// Take in the ray and faces in WORLD coordinates
 fn intersect(ray: &Ray, face: &Face, debug: bool) -> Option<(f32, Vec3)> {
     const TAG: &str = "intersection";
 
@@ -589,20 +621,21 @@ struct Hit {
     ray: Ray,
 }
 
-fn trace(scene: &Scene, ray: &Ray, debug: bool) -> Option<Hit> {
+fn trace(scene: &Scene, cache: &SceneCache, ray: &Ray, debug: bool) -> Option<Hit> {
     let mut hit_dist = FAR_PLANE + 1.0f32;
     let mut hit_point = vec3(0.0f32, 0.0f32, 0.0f32);
     let mut hit_geom_id = 0;
     let mut hit_face = None;
 
     for geom in scene.geometries.iter() {
-        let hit_bounding_box = intersect_aabb(&ray, &geom.bounding_box, &scene.camera.view);
+        let bounding_box = &cache.bounding_boxes[&geom.id];
+        let hit_bounding_box = intersect_aabb(&ray, bounding_box, &scene.camera.view);
         debug_if!(debug, target: "intersect_aabb", "AABB intersect: {}", hit_bounding_box);
         if !hit_bounding_box {
             continue;
         }
 
-        for face in geom.face_iter() {
+        for face in geom.face_iter(cache) {
             if let Some((dist, p)) = intersect(&ray, &face, debug) {
                 if dist < hit_dist {
                     hit_dist = dist;
@@ -677,6 +710,7 @@ fn shade(scene: &Scene, hit: Option<&Hit>, background_color: u32, debug: bool) -
 fn render_one_pixel(
     (x, y): (u32, u32),
     scene: &Scene,
+    cache: &SceneCache,
     render_settings: &RenderSettings,
 ) -> image::Rgb<u8> {
     let (res_w, res_h) = render_settings.resolution;
@@ -702,7 +736,7 @@ fn render_one_pixel(
     );
     let inverse_projection = scene.camera.projection.inverse_transform().unwrap();
     let inverse_view = scene.camera.view.inverse_transform().unwrap();
-    let ray_origin = transform_vec3(&inverse_view, &ray_origin);
+    let ray_origin = transform_vec3(inverse_view, ray_origin);
     let ray_direction = inverse_projection * ray_direction;
     let mut ray_direction = ray_direction.xyz().normalize();
     ray_direction.y *= -1.0;
@@ -710,7 +744,7 @@ fn render_one_pixel(
     debug_if!(debug, target: "ray", "ray: {:?}", ray_direction);
 
     let ray = Ray::new(ray_origin, ray_direction);
-    let hit = trace(&scene, &ray, debug);
+    let hit = trace(&scene, &cache, &ray, debug);
     let color = shade(
         &scene,
         hit.as_ref(),
@@ -723,13 +757,17 @@ fn render_one_pixel(
     image::Rgb([red as u8, green as u8, blue as u8])
 }
 
-fn render(scene: &Scene, render_settings: &RenderSettings) -> ImageBuffer<image::Rgb<u8>, Vec<u8>> {
+fn render(
+    scene: &Scene,
+    cache: &SceneCache,
+    render_settings: &RenderSettings,
+) -> ImageBuffer<image::Rgb<u8>, Vec<u8>> {
     let (res_w, res_h) = render_settings.resolution;
 
     let begin = std::time::Instant::now();
 
     let imgbuf = ImageBuffer::from_fn(res_w, res_h, |x, y| {
-        render_one_pixel((x, y), scene, render_settings)
+        render_one_pixel((x, y), scene, cache, render_settings)
     });
 
     let end = std::time::Instant::now();
@@ -771,6 +809,8 @@ fn interactive_loop(scene: &mut Scene, render_settings: &mut RenderSettings) {
     let mut yaw = Rad(0.0f32);
     let mut pitch = Rad(0.0f32);
     let mut cam_offset = Vec3::zero();
+
+    let mut model_theta = Rad(0.0f32);
 
     'running: loop {
         for event in event_pump.poll_iter() {
@@ -827,6 +867,20 @@ fn interactive_loop(scene: &mut Scene, render_settings: &mut RenderSettings) {
                     needs_redraw = true;
                     cam_offset.x += 1.0;
                 }
+                Event::KeyDown {
+                    keycode: Some(Keycode::Left),
+                    ..
+                } => {
+                    needs_redraw = true;
+                    model_theta += Rad::from(Deg(5.0));
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::Right),
+                    ..
+                } => {
+                    needs_redraw = true;
+                    model_theta -= Rad::from(Deg(5.0));
+                }
                 _ => {}
             }
         }
@@ -847,11 +901,15 @@ fn interactive_loop(scene: &mut Scene, render_settings: &mut RenderSettings) {
                 vec3(0.0, 1.0, 0.0),
             );
 
+            scene.geometries[0].transform = Mat4::from_angle_y(model_theta);
+
+            let cache = build_cache(scene);
+
             canvas.clear();
 
             texture
                 .with_lock(None, |buffer: &mut [u8], _pitch: usize| {
-                    let imgbuf = render(scene, render_settings);
+                    let imgbuf = render(scene, &cache, render_settings);
                     buffer.copy_from_slice(&*imgbuf);
                 })
                 .unwrap();
@@ -892,13 +950,15 @@ fn main() {
 
     let interactive_mode = std::env::args().any(|arg| arg == "--interactive");
 
+    let cache = build_cache(&scene);
+
     if interactive_mode {
         interactive_loop(&mut scene, &mut render_settings);
     } else if let Some(coord) = single_debug_coord {
-        let color = render_one_pixel(coord, &scene, &render_settings);
+        let color = render_one_pixel(coord, &scene, &cache, &render_settings);
         println!("Pixel color is {:?}", color);
     } else {
-        let imgbuf = render(&scene, &render_settings);
+        let imgbuf = render(&scene, &cache, &render_settings);
         imgbuf.save("image.png").unwrap();
     }
 }
