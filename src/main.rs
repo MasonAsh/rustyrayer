@@ -402,7 +402,7 @@ fn create_scene() -> Scene {
 // FIXME: take pre-transformed vertices instead of a face
 // OR
 // Take in the ray and faces in WORLD coordinates
-fn intersect(ray: &Ray, face: &Face, view: &Mat4, debug: bool) -> Option<(f32, Vec3)> {
+fn intersect(ray: &Ray, face: &Face, debug: bool) -> Option<(f32, Vec3)> {
     const TAG: &str = "intersection";
 
     let Ray {
@@ -414,7 +414,6 @@ fn intersect(ray: &Ray, face: &Face, view: &Mat4, debug: bool) -> Option<(f32, V
     } = face;
     let (v0, v1, v2) = (vertices[0], vertices[1], vertices[2]);
     let (v0, v1, v2) = (v0.extend(1.0), v1.extend(1.0), v2.extend(1.0));
-    let (v0, v1, v2) = (view * v0, view * v1, view * v2);
     let (v0, v1, v2) = (v0.xyz(), v1.xyz(), v2.xyz());
 
     debug_if!(
@@ -440,7 +439,7 @@ fn intersect(ray: &Ray, face: &Face, view: &Mat4, debug: bool) -> Option<(f32, V
 
     let d = normal.dot(v0);
 
-    let t = (normal.dot(*origin) + d) / normal_dot_ray_dir;
+    let t = -(normal.dot(*origin) + d) / normal_dot_ray_dir;
     if t < 0.0 {
         debug_if!(debug, target: TAG, "2 triangle behind t={}", t);
         return None;
@@ -518,13 +517,6 @@ fn transform_dir(transform: &Mat4, dir: &Vec3) -> Vec3 {
 }
 
 fn intersect_aabb(ray: &Ray, bb: &AABB, view: &Mat4) -> bool {
-    // TODO: need to decide whether rays should be in world space or view space and stick to that.
-    // we're transforming the ray into world space here.
-    let ray = Ray::new(
-        transform_vec3(&view.inverse_transform().unwrap(), &ray.origin),
-        transform_dir(&view.inverse_transform().unwrap(), &ray.direction),
-    );
-
     let Ray {
         origin,
         inv_dir,
@@ -584,7 +576,7 @@ fn sample(
     let (r, g, b, a) = (f32::from(r), f32::from(g), f32::from(b), f32::from(a));
     let (r, g, b, a) = (r / 255.0, g / 255.0, b / 255.0, a / 255.0);
 
-    debug_if!(debug, target: "samplecolor", "sampled color is {:?}", (r, g, b, a));
+    debug_if!(debug, target: "sample", "sampled color is {:?}", (r, g, b, a));
 
     [r as f32, g as f32, b as f32, a as f32]
 }
@@ -611,7 +603,7 @@ fn trace(scene: &Scene, ray: &Ray, debug: bool) -> Option<Hit> {
         }
 
         for face in geom.face_iter() {
-            if let Some((dist, p)) = intersect(&ray, &face, &scene.camera.view, debug) {
+            if let Some((dist, p)) = intersect(&ray, &face, debug) {
                 if dist < hit_dist {
                     hit_dist = dist;
                     hit_point = p;
@@ -638,7 +630,7 @@ fn shade(scene: &Scene, hit: Option<&Hit>, background_color: u32, debug: bool) -
         (&scene.lights)
             .iter()
             .map(|light| {
-                let light_pos = scene.camera.view * light.position.extend(1.0);
+                let light_pos = light.position.extend(1.0);
                 let light_pos = light_pos.xyz();
                 let hit_to_light = hit.point - light_pos;
                 let hit_to_light = hit_to_light.normalize();
@@ -658,13 +650,7 @@ fn shade(scene: &Scene, hit: Option<&Hit>, background_color: u32, debug: bool) -
                 let diffuse_color =
                     match (image, hit.face.uvs) {
                         (Some(image), Some(uvs)) => {
-                            let view = scene.camera.view;
-                            let verts = [
-                                (view * hit.face.vertices[0].extend(1.0)).xyz(),
-                                (view * hit.face.vertices[1].extend(1.0)).xyz(),
-                                (view * hit.face.vertices[2].extend(1.0)).xyz(),
-                            ];
-                            sample(hit.point, verts, uvs, &image, debug)
+                            sample(hit.point, hit.face.vertices, uvs, &image, debug)
                         },
                         _ => {
                             geometry.color
@@ -711,14 +697,19 @@ fn render_one_pixel(
     let ray_direction = vec4(
         ortho_x / ortho_width,
         ortho_y / ortho_height,
-        0.0f32,
+        -1.0f32,
         1.0f32,
     );
     let inverse_projection = scene.camera.projection.inverse_transform().unwrap();
+    let inverse_view = scene.camera.view.inverse_transform().unwrap();
+    let ray_origin = transform_vec3(&inverse_view, &ray_origin);
     let ray_direction = inverse_projection * ray_direction;
+    let mut ray_direction = ray_direction.xyz().normalize();
+    ray_direction.y *= -1.0;
+    let ray_direction = transform_dir(&inverse_view, &ray_direction);
     debug_if!(debug, target: "ray", "ray: {:?}", ray_direction);
 
-    let ray = Ray::new(ray_origin, ray_direction.xyz());
+    let ray = Ray::new(ray_origin, ray_direction);
     let hit = trace(&scene, &ray, debug);
     let color = shade(
         &scene,
@@ -844,7 +835,7 @@ fn interactive_loop(scene: &mut Scene, render_settings: &mut RenderSettings) {
             // Orbit the camera with our yaw and pitch angles
             let camera_position = Quaternion::from_angle_y(-yaw)
                 * Quaternion::from_angle_x(pitch)
-                * vec3(0.0, 0.0, orbit_dist)
+                * vec3(0.0, 0.0, -orbit_dist)
                 + cam_offset;
 
             // Mat4::look_at requires a Point3
