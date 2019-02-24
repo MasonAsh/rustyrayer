@@ -426,10 +426,15 @@ fn create_scene() -> Scene {
             ortho_height: 5.0f32,
         },
         geometries: vec![create_cube(Some(diffuse_texture_id))],
-        ambient_light: [0.2, 0.2, 0.2],
-        lights: vec![Light {
-            position: vec3(1.0, 1.0, -1.2),
-        }],
+        ambient_light: [0.02, 0.02, 0.02],
+        lights: vec![
+            Light {
+                position: vec3(1.5, 1.5, 1.5),
+            },
+            Light {
+                position: vec3(0.0, 1.2, 0.0),
+            },
+        ],
         texture_storage,
     }
 }
@@ -502,6 +507,9 @@ fn intersect(ray: &Ray, face: &Face, debug: bool) -> Option<(f32, Vec3)> {
         debug_if!(debug, target: TAG, "5 P on right of edge2");
         return None;
     }
+
+    // FIXME: why is p.z the wrong sign?
+    let p = vec3(p.x, p.y, -p.z);
 
     Some((t, p))
 }
@@ -621,7 +629,7 @@ struct Hit {
     ray: Ray,
 }
 
-fn trace(scene: &Scene, cache: &SceneCache, ray: &Ray, debug: bool) -> Option<Hit> {
+fn trace(scene: &Scene, cache: &SceneCache, ray: &Ray, min_dist: f32, debug: bool) -> Option<Hit> {
     let mut hit_dist = FAR_PLANE + 1.0f32;
     let mut hit_point = vec3(0.0f32, 0.0f32, 0.0f32);
     let mut hit_geom_id = 0;
@@ -637,7 +645,7 @@ fn trace(scene: &Scene, cache: &SceneCache, ray: &Ray, debug: bool) -> Option<Hi
 
         for face in geom.face_iter(cache) {
             if let Some((dist, p)) = intersect(&ray, &face, debug) {
-                if dist < hit_dist {
+                if dist < hit_dist && dist > min_dist {
                     hit_dist = dist;
                     hit_point = p;
                     hit_geom_id = geom.id;
@@ -658,17 +666,31 @@ fn trace(scene: &Scene, cache: &SceneCache, ray: &Ray, debug: bool) -> Option<Hi
     })
 }
 
-fn shade(scene: &Scene, hit: Option<&Hit>, background_color: u32, debug: bool) -> u32 {
+fn shade(
+    scene: &Scene,
+    cache: &SceneCache,
+    hit: Option<&Hit>,
+    background_color: u32,
+    debug: bool,
+) -> u32 {
     if let Some(hit) = hit {
         (&scene.lights)
             .iter()
             .map(|light| {
-                let light_pos = light.position.extend(1.0);
-                let light_pos = light_pos.xyz();
-                let hit_to_light = hit.point - light_pos;
+                let light_pos = light.position;
+                let hit_to_light = light_pos - hit.point;
                 let hit_to_light = hit_to_light.normalize();
+
+                // Cast a ray towards the light
+                // TODO: The minimum distance is the trace was determined by trial and error to minimize
+                // self intersecting artifacts but isn't perfect.
+                let ray = Ray::new(hit.point, hit_to_light);
+                let is_shadowed = trace(scene, cache, &ray, 0.000_005, debug).is_some();
+                debug_if!(debug, target: "shade", "shadowed: {}", is_shadowed);
+
                 let angle = hit_to_light.angle(hit.face.normal);
-                let shade = angle.cos();
+                let shade = if !is_shadowed { angle.cos().abs() } else { 0.0 };
+
                 debug_if!(debug, target: "shade", "shade={} P={:?} angle={:?} light={:?} raydir={:?}", shade, hit.point, angle, light_pos, hit.ray.direction);
 
                 debug_if!(debug, target: "shade", "FACE={:?}", hit.face);
@@ -693,9 +715,9 @@ fn shade(scene: &Scene, hit: Option<&Hit>, background_color: u32, debug: bool) -
                 let ambient_light = scene.ambient_light;
 
                 let final_color = [
-                    (ambient_light[0] + diffuse_color[0]) + (diffuse_color[0] * shade),
-                    (ambient_light[1] + diffuse_color[1]) + (diffuse_color[1] * shade),
-                    (ambient_light[2] + diffuse_color[2]) + (diffuse_color[2] * shade),
+                    (ambient_light[0]) + (diffuse_color[0] * shade),
+                    (ambient_light[1]) + (diffuse_color[1] * shade),
+                    (ambient_light[2]) + (diffuse_color[2] * shade),
                     diffuse_color[3],
                 ];
 
@@ -744,9 +766,10 @@ fn render_one_pixel(
     debug_if!(debug, target: "ray", "ray: {:?}", ray_direction);
 
     let ray = Ray::new(ray_origin, ray_direction);
-    let hit = trace(&scene, &cache, &ray, debug);
+    let hit = trace(&scene, &cache, &ray, 0.0, debug);
     let color = shade(
-        &scene,
+        scene,
+        cache,
         hit.as_ref(),
         render_settings.background_color,
         debug,
