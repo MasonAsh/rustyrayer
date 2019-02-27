@@ -1,6 +1,6 @@
 use cgmath::{
-    perspective, vec2, vec3, vec4, Angle, Array, Deg, EuclideanSpace, InnerSpace, Matrix4, Point3,
-    Quaternion, Rad, Rotation, Rotation3, SquareMatrix, Transform, Vector2, Vector3, Zero,
+    vec2, vec3, Angle, Array, Deg, EuclideanSpace, InnerSpace, Matrix4, Point3, Quaternion, Rad,
+    Rotation, Rotation3, SquareMatrix, Transform, Vector2, Vector3, Zero,
 };
 use env_logger;
 use image;
@@ -26,7 +26,6 @@ type Vec2 = Vector2<f32>;
 type Vec3 = Vector3<f32>;
 type Mat4 = Matrix4<f32>;
 
-const NEAR_PLANE: f32 = 0.5f32;
 const FAR_PLANE: f32 = 10_000_000_000.0f32;
 
 fn compact_color(input: [f32; 4]) -> u32 {
@@ -97,16 +96,6 @@ struct Light {
 
 struct AABB {
     bounds: [Vec3; 2],
-}
-
-impl AABB {
-    fn min(&self) -> &Vec3 {
-        &self.bounds[0]
-    }
-
-    fn max(&self) -> &Vec3 {
-        &self.bounds[1]
-    }
 }
 
 fn aabb(points: &[Vec3]) -> AABB {
@@ -257,8 +246,7 @@ impl Geometry {
 }
 
 struct Camera {
-    view: Mat4,
-    projection: Mat4,
+    camera_to_world: Mat4,
     ortho_width: f32,
     ortho_height: f32,
 }
@@ -414,14 +402,13 @@ fn create_scene() -> Scene {
         Point3::new(0.0, 0.0, 0.0),
         vec3(0.0, 1.0, 0.0),
     );
-    let projection = perspective(Deg(75.0), 1.0, NEAR_PLANE, FAR_PLANE);
+    let camera_to_world = view.inverse_transform().unwrap();
     let mut texture_storage = TextureStorage::new();
     let diffuse_texture_id = texture_storage.load("test.png");
 
     Scene {
         camera: Camera {
-            view,
-            projection,
+            camera_to_world,
             ortho_width: 5.0f32,
             ortho_height: 5.0f32,
         },
@@ -439,110 +426,41 @@ fn create_scene() -> Scene {
     }
 }
 
-fn intersect(ray: &Ray, face: &Face, debug: bool) -> Option<(f32, Vec3)> {
-    const TAG: &str = "intersection";
+#[allow(clippy::many_single_char_names)]
+/// Checks if a ray hits a triangle using the Möller–Trumbore algorithm
+fn intersect(ray: &Ray, face: &Face) -> Option<(f32, Vec3)> {
+    assert!(ray.direction.magnitude() < 1.0 + 0.01);
+    assert!(ray.direction.magnitude() > 1.0 - 0.01);
 
     let Ray {
         origin, direction, ..
     } = ray;
-    let Face {
-        vertices, /*normal,*/
-        ..
-    } = face;
-    let (v0, v1, v2) = (vertices[0], vertices[1], vertices[2]);
-    let (v0, v1, v2) = (v0.extend(1.0), v1.extend(1.0), v2.extend(1.0));
-    let (v0, v1, v2) = (v0.xyz(), v1.xyz(), v2.xyz());
-
-    debug_if!(
-        debug,
-        target: TAG,
-        "Intersect test:\nRay origin={:?} & direction={:?}\nv0={:?}\nv1={:?}\nv2={:?}",
-        origin,
-        direction,
-        v0,
-        v1,
-        v2
-    );
-
-    let v0_v1 = v1 - v0;
-    let v0_v2 = v2 - v0;
-    let normal = v0_v1.cross(v0_v2);
-
-    let normal_dot_ray_dir = normal.dot(*direction);
-    if normal_dot_ray_dir.abs() < core::f32::EPSILON {
-        debug_if!(debug, target: TAG, "1 parallel");
+    let [v0, v1, v2] = face.vertices;
+    let edge1 = v1 - v0;
+    let edge2 = v2 - v0;
+    let h = direction.cross(edge2);
+    let a = edge1.dot(h);
+    if a > -core::f32::EPSILON && a < -core::f32::EPSILON {
         return None;
     }
-
-    let d = normal.dot(v0);
-
-    let t = -(normal.dot(*origin) + d) / normal_dot_ray_dir;
-    if t < 0.0 {
-        debug_if!(debug, target: TAG, "2 triangle behind t={}", t);
+    let f = 1.0 / a;
+    let s = origin - v0;
+    let u = f * s.dot(h);
+    if u < 0.0 || u > 1.0 {
         return None;
     }
-
-    let p = origin + t * direction;
-
-    let edge0 = v0_v1;
-    let vp0 = p - v0;
-    let c = edge0.cross(vp0);
-    if normal.dot(c) < 0.0 {
-        debug_if!(debug, target: TAG, "3 P on right of edge0");
+    let q = s.cross(edge1);
+    let v = f * direction.dot(q);
+    if v < 0.0 || u + v > 1.0 {
         return None;
     }
-
-    let edge1 = v2 - v1;
-    let vp1 = p - v1;
-    let c = edge1.cross(vp1);
-    if normal.dot(c) < 0.0 {
-        debug_if!(debug, target: TAG, "4 P on right of edge1");
-        return None;
+    let t = f * edge2.dot(q);
+    if t > core::f32::EPSILON {
+        let p = origin + direction * t;
+        Some((t, p))
+    } else {
+        None
     }
-
-    let edge2 = v0 - v2;
-    let vp2 = p - v2;
-    let c = edge2.cross(vp2);
-    if normal.dot(c) < 0.0 {
-        debug_if!(debug, target: TAG, "5 P on right of edge2");
-        return None;
-    }
-
-    // FIXME: why is p.z the wrong sign?
-    let p = vec3(p.x, p.y, -p.z);
-
-    Some((t, p))
-}
-
-fn min_vec3(a: &Vec3, b: &Vec3) -> Vec3 {
-    vec3(a.x.min(b.x), a.y.min(b.y), a.z.min(b.z))
-}
-
-fn max_vec3(a: &Vec3, b: &Vec3) -> Vec3 {
-    vec3(a.x.max(b.x), a.y.max(b.y), a.z.max(b.z))
-}
-
-fn transform_aabb(transform: &Mat4, bb: &AABB) -> AABB {
-    let right = transform.x;
-    let up = transform.y;
-    let back = transform.z;
-    let xa = right * bb.min().x;
-    let xb = right * bb.max().x;
-    let ya = up * bb.min().y;
-    let yb = up * bb.max().y;
-    let za = back * bb.min().z;
-    let zb = back * bb.max().z;
-
-    let xa = xa.xyz();
-    let xb = xb.xyz();
-    let ya = ya.xyz();
-    let yb = yb.xyz();
-    let za = za.xyz();
-    let zb = zb.xyz();
-
-    let min = min_vec3(&xa, &xb) + min_vec3(&ya, &yb) + min_vec3(&za, &zb);
-    let max = max_vec3(&xa, &xb) + max_vec3(&ya, &yb) + max_vec3(&za, &zb);
-    AABB { bounds: [min, max] }
 }
 
 fn transform_dir(transform: &Mat4, dir: &Vec3) -> Vec3 {
@@ -556,15 +474,13 @@ fn transform_dir(transform: &Mat4, dir: &Vec3) -> Vec3 {
     vec3(res.x, res.y, res.z)
 }
 
-fn intersect_aabb(ray: &Ray, bb: &AABB, view: &Mat4) -> bool {
+fn intersect_aabb(ray: &Ray, bb: &AABB) -> bool {
     let Ray {
         origin,
         inv_dir,
         inv_dir_sign,
         ..
     } = ray;
-
-    let bb = transform_aabb(view, bb);
 
     let tmin = (bb.bounds[inv_dir_sign[0]].x - origin.x) * inv_dir.x;
     let tmax = (bb.bounds[1 - inv_dir_sign[0]].x - origin.x) * inv_dir.x;
@@ -625,7 +541,6 @@ struct Hit {
     face: Face,
     geometry_id: u32,
     point: Vec3,
-    //distance: f32,
     ray: Ray,
 }
 
@@ -637,14 +552,14 @@ fn trace(scene: &Scene, cache: &SceneCache, ray: &Ray, min_dist: f32, debug: boo
 
     for geom in scene.geometries.iter() {
         let bounding_box = &cache.bounding_boxes[&geom.id];
-        let hit_bounding_box = intersect_aabb(&ray, bounding_box, &scene.camera.view);
+        let hit_bounding_box = intersect_aabb(&ray, bounding_box);
         debug_if!(debug, target: "intersect_aabb", "AABB intersect: {}", hit_bounding_box);
         if !hit_bounding_box {
             continue;
         }
 
         for face in geom.face_iter(cache) {
-            if let Some((dist, p)) = intersect(&ray, &face, debug) {
+            if let Some((dist, p)) = intersect(&ray, &face) {
                 if dist < hit_dist && dist > min_dist {
                     hit_dist = dist;
                     hit_point = p;
@@ -747,22 +662,14 @@ fn render_one_pixel(
     let y = y as f32;
     let res_w = res_w as f32;
     let res_h = res_h as f32;
-    let ortho_x = -(x / res_w) * ortho_width + (ortho_width / 2.0);
-    let ortho_y = (y / res_h) * ortho_height - (ortho_height / 2.0);
+    let ortho_x = (x / res_w) * ortho_width - (ortho_width / 2.0);
+    let ortho_y = -(y / res_h) * ortho_height + (ortho_height / 2.0);
     let ray_origin = vec3(0.0, 0.0, 0.0f32);
-    let ray_direction = vec4(
-        ortho_x / ortho_width,
-        ortho_y / ortho_height,
-        -1.0f32,
-        1.0f32,
-    );
-    let inverse_projection = scene.camera.projection.inverse_transform().unwrap();
-    let inverse_view = scene.camera.view.inverse_transform().unwrap();
-    let ray_origin = transform_vec3(inverse_view, ray_origin);
-    let ray_direction = inverse_projection * ray_direction;
-    let mut ray_direction = ray_direction.xyz().normalize();
-    ray_direction.y *= -1.0;
-    let ray_direction = transform_dir(&inverse_view, &ray_direction);
+    let ray_direction = vec3(ortho_x / ortho_width, ortho_y / ortho_height, -1.0f32);
+    let camera_to_world = scene.camera.camera_to_world;
+    let ray_origin = transform_vec3(camera_to_world, ray_origin);
+    let ray_direction = transform_dir(&camera_to_world, &ray_direction);
+    let ray_direction = ray_direction.normalize();
     debug_if!(debug, target: "ray", "ray: {:?}", ray_direction);
 
     let ray = Ray::new(ray_origin, ray_direction);
@@ -828,12 +735,12 @@ fn interactive_loop(scene: &mut Scene, render_settings: &mut RenderSettings) {
     let mut mouse_down = false;
 
     // Camera orbit parameters
-    let mut orbit_dist = 5.0f32;
+    let mut orbit_dist = 10.0f32;
     let mut yaw = Rad(0.0f32);
     let mut pitch = Rad(0.0f32);
     let mut cam_offset = Vec3::zero();
 
-    let mut model_theta = Rad(0.0f32);
+    let mut model_pos = Vec3::zero();
 
     'running: loop {
         for event in event_pump.poll_iter() {
@@ -895,14 +802,28 @@ fn interactive_loop(scene: &mut Scene, render_settings: &mut RenderSettings) {
                     ..
                 } => {
                     needs_redraw = true;
-                    model_theta += Rad::from(Deg(5.0));
+                    model_pos.x -= 2.0;
                 }
                 Event::KeyDown {
                     keycode: Some(Keycode::Right),
                     ..
                 } => {
                     needs_redraw = true;
-                    model_theta -= Rad::from(Deg(5.0));
+                    model_pos.x += 2.0;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::Up),
+                    ..
+                } => {
+                    needs_redraw = true;
+                    model_pos.y += 2.0;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::Down),
+                    ..
+                } => {
+                    needs_redraw = true;
+                    model_pos.y -= 2.0;
                 }
                 _ => {}
             }
@@ -910,21 +831,23 @@ fn interactive_loop(scene: &mut Scene, render_settings: &mut RenderSettings) {
 
         if needs_redraw {
             // Orbit the camera with our yaw and pitch angles
-            let camera_position = Quaternion::from_angle_y(-yaw)
-                * Quaternion::from_angle_x(pitch)
-                * vec3(0.0, 0.0, -orbit_dist)
+            let camera_position = Quaternion::from_angle_y(yaw)
+                * Quaternion::from_angle_x(-pitch)
+                * vec3(0.0, 0.0, orbit_dist)
                 + cam_offset;
 
             // Mat4::look_at requires a Point3
             let camera_position = Point3::from_vec(camera_position);
 
-            scene.camera.view = Mat4::look_at(
+            scene.camera.camera_to_world = Mat4::look_at(
                 camera_position,
                 Point3::from_vec(cam_offset),
                 vec3(0.0, 1.0, 0.0),
-            );
+            )
+            .inverse_transform()
+            .unwrap();
 
-            scene.geometries[0].transform = Mat4::from_angle_y(model_theta);
+            scene.geometries[0].transform = Mat4::from_translation(model_pos);
 
             let cache = build_cache(scene);
 
