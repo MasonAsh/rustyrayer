@@ -11,6 +11,10 @@ log = "0.4"
 env_logger = "0.6.0"
 rand = "0.6.5"
 
+[dependencies.gltf]
+git = "https://github.com/gltf-rs/gltf"
+features = ["extras"]
+
 [dependencies.cgmath]
 version = "0.17.0"
 features = ["swizzle"]

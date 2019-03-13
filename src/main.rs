@@ -1,11 +1,12 @@
 use cgmath::{
-    vec2, vec3, Angle, Array, Deg, EuclideanSpace, InnerSpace, Matrix4, Point3, Quaternion, Rad,
+    vec2, vec3, Angle, Array, EuclideanSpace, InnerSpace, Matrix4, Point3, Quaternion, Rad,
     Rotation, Rotation3, SquareMatrix, Transform, Vector2, Vector3, Zero,
 };
 use env_logger;
+use gltf;
 use image;
 use image::{DynamicImage, GenericImageView, ImageBuffer, Pixel};
-use log::{debug, info};
+use log::{debug, info, warn};
 use rand;
 use sdl2;
 use sdl2::event::Event;
@@ -13,6 +14,7 @@ use sdl2::keyboard::Keycode;
 use sdl2::mouse::MouseButton;
 use sdl2::pixels::PixelFormatEnum;
 use std::collections::HashMap;
+use std::path::Path;
 
 macro_rules! debug_if(
     ( $enable_debug:expr, target: $target:expr, $($debug_params:tt)* ) => (
@@ -117,7 +119,7 @@ struct Geometry {
     id: u32,
     vertices: Vec<Vec3>,
     uvs: Option<Vec<Vec2>>,
-    indices: Vec<i32>,
+    indices: Vec<u32>,
     color: [f32; 4],
     diffuse_texture_id: Option<u64>,
     transform: Mat4,
@@ -130,7 +132,7 @@ impl Default for Geometry {
             vertices: Vec::new(),
             uvs: None,
             indices: Vec::new(),
-            color: [0.0; 4],
+            color: [1.0; 4],
             diffuse_texture_id: None,
             transform: Mat4::identity(),
         }
@@ -153,17 +155,15 @@ impl TextureStorage {
         }
     }
 
-    fn load(&mut self, path: &str) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+    fn load_gltf_texture(&mut self, image: &gltf::image::Data) -> Option<u64> {
+        let buf = ImageBuffer::from_raw(image.width, image.height, image.pixels.clone());
+        buf.map(|buf| {
+            let image = DynamicImage::ImageRgba8(buf);
+            let id = rand::random();
+            self.textures.push(Texture { id, image });
 
-        let image = image::open(path).unwrap();
-        let mut hasher = DefaultHasher::new();
-        Hash::hash(path, &mut hasher);
-        let id = hasher.finish();
-        self.textures.push(Texture { id, image });
-
-        id
+            id
+        })
     }
 
     fn fetch(&self, id: u64) -> Option<&DynamicImage> {
@@ -302,128 +302,152 @@ struct RenderSettings {
     debug_coord: Option<(u32, u32)>,
 }
 
-fn create_cube(diffuse_texture_id: Option<u64>) -> Geometry {
-    let vertices = vec![
-        vec3(-1.0, 1.0, -1.0),
-        vec3(1.0, 1.0, 1.0),
-        vec3(1.0, 1.0, -1.0),
-        vec3(1.0, 1.0, 1.0),
-        vec3(-1.0, -1.0, 1.0),
-        vec3(1.0, -1.0, 1.0),
-        vec3(-1.0, 1.0, 1.0),
-        vec3(-1.0, -1.0, -1.0),
-        vec3(-1.0, -1.0, 1.0),
-        vec3(1.0, -1.0, -1.0),
-        vec3(-1.0, -1.0, 1.0),
-        vec3(-1.0, -1.0, -1.0),
-        vec3(1.0, 1.0, -1.0),
-        vec3(1.0, -1.0, 1.0),
-        vec3(1.0, -1.0, -1.0),
-        vec3(-1.0, 1.0, -1.0),
-        vec3(1.0, -1.0, -1.0),
-        vec3(-1.0, -1.0, -1.0),
-        vec3(-1.0, 1.0, -1.0),
-        vec3(-1.0, 1.0, 1.0),
-        vec3(1.0, 1.0, 1.0),
-        vec3(1.0, 1.0, 1.0),
-        vec3(-1.0, 1.0, 1.0),
-        vec3(-1.0, -1.0, 1.0),
-        vec3(-1.0, 1.0, 1.0),
-        vec3(-1.0, 1.0, -1.0),
-        vec3(-1.0, -1.0, -1.0),
-        vec3(1.0, -1.0, -1.0),
-        vec3(1.0, -1.0, 1.0),
-        vec3(-1.0, -1.0, 1.0),
-        vec3(1.0, 1.0, -1.0),
-        vec3(1.0, 1.0, 1.0),
-        vec3(1.0, -1.0, 1.0),
-        vec3(-1.0, 1.0, -1.0),
-        vec3(1.0, 1.0, -1.0),
-        vec3(1.0, -1.0, -1.0),
-    ];
+fn read_gltf_mesh(
+    mesh: &gltf::Mesh,
+    transform: &Mat4,
+    buffers: &[gltf::buffer::Data],
+    images: &[gltf::image::Data],
+    texture_storage: &mut TextureStorage,
+) -> Vec<Geometry> {
+    use gltf::mesh::Mode;
+    use gltf::mesh::Semantic;
 
-    let uvs = vec![
-        vec2(0.625, 0.0),
-        vec2(0.375, 0.25),
-        vec2(0.375, 0.0),
-        vec2(0.625, 0.25),
-        vec2(0.375, 0.5),
-        vec2(0.375, 0.25),
-        vec2(0.625, 0.5),
-        vec2(0.375, 0.75),
-        vec2(0.375, 0.5),
-        vec2(0.625, 0.75),
-        vec2(0.375, 1.0),
-        vec2(0.375, 0.75),
-        vec2(0.375, 0.5),
-        vec2(0.125, 0.75),
-        vec2(0.125, 0.5),
-        vec2(0.875, 0.5),
-        vec2(0.625, 0.75),
-        vec2(0.625, 0.5),
-        vec2(0.625, 0.0),
-        vec2(0.625, 0.25),
-        vec2(0.375, 0.25),
-        vec2(0.625, 0.25),
-        vec2(0.625, 0.5),
-        vec2(0.375, 0.5),
-        vec2(0.625, 0.5),
-        vec2(0.625, 0.75),
-        vec2(0.375, 0.75),
-        vec2(0.625, 0.75),
-        vec2(0.625, 1.0),
-        vec2(0.375, 1.0),
-        vec2(0.375, 0.5),
-        vec2(0.375, 0.75),
-        vec2(0.125, 0.75),
-        vec2(0.875, 0.5),
-        vec2(0.875, 0.75),
-        vec2(0.625, 0.75),
-    ];
+    let valid_primitives = mesh
+        .primitives()
+        .filter(|primitives| {
+            if primitives.mode() != Mode::Triangles {
+                warn!("found non-triangle primitives which will be ignored");
+                false
+            } else {
+                true
+            }
+        })
+        .filter(|primitives| {
+            if primitives.indices().is_none() {
+                warn!("found primitives without indices which will be ignored");
+                false
+            } else {
+                true
+            }
+        })
+        .filter(|primitives| {
+            if primitives.get(&Semantic::Positions).is_none() {
+                warn!("found primitives without positions which will be ignored");
+                false
+            } else {
+                true
+            }
+        });
 
-    let uvs = Some(uvs);
-    let indices = (0..36).collect();
-    let transform = Mat4::from_axis_angle(vec3(0.0, 1.0, 0.0), Deg(50.0));
+    valid_primitives
+        .map(|prim| {
+            let reader = prim.reader(|buffer| Some(&buffers[buffer.index()]));
 
-    Geometry {
-        vertices,
-        uvs,
-        indices,
-        color: [1.0, 0.0, 0.0, 1.0],
-        diffuse_texture_id,
-        transform,
-        ..Default::default()
+            let positions = reader.read_positions().unwrap();
+            let positions: Vec<_> = positions
+                .map(|position| vec3(position[0], position[1], position[2]))
+                .collect();
+
+            let indices = reader.read_indices().unwrap();
+            let indices = indices.into_u32().collect::<Vec<_>>();
+
+            let material = prim.material();
+            let pbr = material.pbr_metallic_roughness();
+            let color = pbr.base_color_factor();
+            let mut diffuse_texture_id = None;
+            let mut uvs = None;
+            if let Some(texinfo) = pbr.base_color_texture() {
+                let tex_coord_idx = texinfo.tex_coord();
+
+                let gltf_tex = texinfo.texture();
+
+                diffuse_texture_id = texture_storage.load_gltf_texture(&images[gltf_tex.index()]);
+
+                let in_uvs = reader.read_tex_coords(tex_coord_idx);
+                uvs = in_uvs.map(|uvs| {
+                    uvs.into_f32()
+                        .map(|uv| vec2(uv[0], uv[1]))
+                        .collect::<Vec<_>>()
+                });
+            }
+
+            Geometry {
+                vertices: positions,
+                indices,
+                uvs,
+                transform: *transform,
+                diffuse_texture_id,
+                color,
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+fn read_gltf_node_and_children(
+    node: &gltf::Node,
+    parent_transform: Mat4,
+    buffers: &[gltf::buffer::Data],
+    images: &[gltf::image::Data],
+    texture_storage: &mut TextureStorage,
+    geometries: &mut Vec<Geometry>,
+    camera: &mut Camera,
+) {
+    let transform: Mat4 = node.transform().matrix().into();
+    let transform = parent_transform * transform;
+
+    if let Some(mesh) = node.mesh() {
+        geometries.extend(read_gltf_mesh(&mesh, &transform, buffers, images, texture_storage));
+    }
+
+    if node.camera().is_some() {
+        camera.camera_to_world = transform;
+    }
+
+    for child in node.children() {
+        read_gltf_node_and_children(&child, transform, buffers, images, texture_storage, geometries, camera);
     }
 }
 
-fn create_scene() -> Scene {
-    let view = Mat4::look_at(
+/// Loads a gltf scene from a specified path.
+/// Currently lights are hardcoded, as lights are not a core part of the gltf file format.
+/// Lights are available in gltf through the KHR_punctual_lights extensions, but for the
+/// time being there is no way to access the extension data through the gltf crate.
+fn load_scene(path: &Path) -> Result<Scene, gltf::Error> {
+    let (gltf, buffers, images) = gltf::import(path)?;
+
+    let mut geometries: Vec<Geometry> = Vec::new();
+
+    let mut texture_storage = TextureStorage::new();
+
+    let default_view = Mat4::look_at(
         Point3::new(0.0f32, 0.0f32, -5.0f32),
         Point3::new(0.0, 0.0, 0.0),
         vec3(0.0, 1.0, 0.0),
     );
-    let camera_to_world = view.inverse_transform().unwrap();
-    let mut texture_storage = TextureStorage::new();
-    let diffuse_texture_id = texture_storage.load("test.png");
+    let camera_to_world = default_view.inverse_transform().unwrap();
 
-    Scene {
-        camera: Camera {
-            camera_to_world,
-            ortho_width: 5.0f32,
-            ortho_height: 5.0f32,
-        },
-        geometries: vec![create_cube(Some(diffuse_texture_id))],
-        ambient_light: [0.02, 0.02, 0.02],
-        lights: vec![
-            Light {
-                position: vec3(1.5, 1.5, 1.5),
-            },
-            Light {
-                position: vec3(0.0, 1.2, 0.0),
-            },
-        ],
-        texture_storage,
+    let mut camera = Camera {
+        camera_to_world,
+        ortho_width: 5.0f32,
+        ortho_height: 5.0f32,
+    };
+
+    for scene in gltf.scenes() {
+        for node in scene.nodes() {
+            read_gltf_node_and_children(&node, Mat4::identity(), &buffers, &images, &mut texture_storage, &mut geometries, &mut camera);
+        }
     }
+
+    Ok(Scene {
+        camera,
+        geometries,
+        ambient_light: [0.04, 0.04, 0.04],
+        lights: vec![Light {
+            position: vec3(2.0, 2.0, 2.0),
+        }],
+        texture_storage,
+    })
 }
 
 #[allow(clippy::many_single_char_names)]
@@ -594,13 +618,14 @@ fn shade(
             .map(|light| {
                 let light_pos = light.position;
                 let hit_to_light = light_pos - hit.point;
+                let hit_light_dist2 = hit_to_light.magnitude2();
                 let hit_to_light = hit_to_light.normalize();
 
                 // Cast a ray towards the light
                 // TODO: The minimum distance is the trace was determined by trial and error to minimize
                 // self intersecting artifacts but isn't perfect.
                 let ray = Ray::new(hit.point, hit_to_light);
-                let is_shadowed = trace(scene, cache, &ray, 0.000_005, debug).is_some();
+                let is_shadowed = trace(scene, cache, &ray, 0.000_005, debug).filter(|shadow_hit| (shadow_hit.point - hit.point).magnitude2()  < hit_light_dist2).is_some();
                 debug_if!(debug, target: "shade", "shadowed: {}", is_shadowed);
 
                 let angle = hit_to_light.angle(hit.face.normal);
@@ -740,8 +765,6 @@ fn interactive_loop(scene: &mut Scene, render_settings: &mut RenderSettings) {
     let mut pitch = Rad(0.0f32);
     let mut cam_offset = Vec3::zero();
 
-    let mut model_pos = Vec3::zero();
-
     'running: loop {
         for event in event_pump.poll_iter() {
             match event {
@@ -797,34 +820,6 @@ fn interactive_loop(scene: &mut Scene, render_settings: &mut RenderSettings) {
                     needs_redraw = true;
                     cam_offset.x += 1.0;
                 }
-                Event::KeyDown {
-                    keycode: Some(Keycode::Left),
-                    ..
-                } => {
-                    needs_redraw = true;
-                    model_pos.x -= 2.0;
-                }
-                Event::KeyDown {
-                    keycode: Some(Keycode::Right),
-                    ..
-                } => {
-                    needs_redraw = true;
-                    model_pos.x += 2.0;
-                }
-                Event::KeyDown {
-                    keycode: Some(Keycode::Up),
-                    ..
-                } => {
-                    needs_redraw = true;
-                    model_pos.y += 2.0;
-                }
-                Event::KeyDown {
-                    keycode: Some(Keycode::Down),
-                    ..
-                } => {
-                    needs_redraw = true;
-                    model_pos.y -= 2.0;
-                }
                 _ => {}
             }
         }
@@ -846,8 +841,6 @@ fn interactive_loop(scene: &mut Scene, render_settings: &mut RenderSettings) {
             )
             .inverse_transform()
             .unwrap();
-
-            scene.geometries[0].transform = Mat4::from_translation(model_pos);
 
             let cache = build_cache(scene);
 
@@ -872,7 +865,6 @@ fn interactive_loop(scene: &mut Scene, render_settings: &mut RenderSettings) {
 fn main() {
     env_logger::init();
 
-    let mut scene = create_scene();
     let mut args_iter = std::env::args();
     let single_debug_coord = args_iter.position(|arg| arg == "--sdc").and_then(|_| {
         let debug_coord = args_iter.next();
@@ -887,6 +879,19 @@ fn main() {
             })
         })
     });
+
+    let mut args_iter = std::env::args();
+    let scene_file = args_iter
+        .position(|arg| arg == "--scene")
+        .and_then(|_| args_iter.next());
+
+    if scene_file.is_none() {
+        eprintln!("No scene file specified. Please specify a scene file using --scene");
+        std::process::exit(-1);
+    }
+
+    let mut scene = load_scene(Path::new(scene_file.unwrap().as_str()))
+        .expect("failed to load specified scene file");
 
     let mut render_settings = RenderSettings {
         resolution: (640, 480),
