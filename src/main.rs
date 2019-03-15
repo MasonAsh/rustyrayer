@@ -8,12 +8,12 @@ use image;
 use image::{DynamicImage, GenericImageView, ImageBuffer, Pixel};
 use log::{debug, info, warn};
 use rand;
+use rayon::prelude::*;
 use sdl2;
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 use sdl2::mouse::MouseButton;
 use sdl2::pixels::PixelFormatEnum;
-use std::collections::HashMap;
 use std::path::Path;
 
 macro_rules! debug_if(
@@ -29,6 +29,7 @@ type Vec3 = Vector3<f32>;
 type Mat4 = Matrix4<f32>;
 
 const FAR_PLANE: f32 = 10_000_000_000.0f32;
+const TILE_SIZE: u32 = 8;
 
 fn compact_color(input: [f32; 4]) -> u32 {
     let r: u32 = (input[0].max(0.0).min(1.0) * 255.0) as u32;
@@ -184,6 +185,7 @@ struct Face {
 
 struct FaceIter<'a> {
     geometry: &'a Geometry,
+    geometry_idx: usize,
     cache: &'a SceneCache,
     face_idx: u32,
 }
@@ -204,13 +206,16 @@ impl Iterator for FaceIter<'_> {
         }
 
         let FaceIter {
-            cache, geometry, ..
+            cache,
+            geometry,
+            geometry_idx,
+            ..
         } = self;
 
         let indices_idx = (self.face_idx * 3) as usize;
         self.face_idx += 1;
         if indices_idx < geometry.indices.len() {
-            let pretransformed_verts = &cache.world_space_verts[&geometry.id];
+            let pretransformed_verts = &cache.world_space_verts[*geometry_idx];
             let index0 = geometry.indices[indices_idx] as usize;
             let index1 = geometry.indices[indices_idx + 1] as usize;
             let index2 = geometry.indices[indices_idx + 2] as usize;
@@ -236,11 +241,12 @@ impl Iterator for FaceIter<'_> {
 }
 
 impl Geometry {
-    fn face_iter<'a>(&'a self, cache: &'a SceneCache) -> FaceIter<'a> {
+    fn face_iter<'a>(&'a self, cache: &'a SceneCache, geometry_idx: usize) -> FaceIter<'a> {
         FaceIter {
             geometry: self,
             cache,
             face_idx: 0,
+            geometry_idx,
         }
     }
 }
@@ -268,12 +274,12 @@ impl Scene {
 /// The Scene structure is intended to be a "pure" representation of the scene.
 /// SceneCache holds all the hot data that should be precomputed before a render.
 struct SceneCache {
-    world_space_verts: HashMap<u32, Vec<Vec3>>,
-    bounding_boxes: HashMap<u32, AABB>,
+    world_space_verts: Vec<Vec<Vec3>>,
+    bounding_boxes: Vec<AABB>,
 }
 
 fn build_cache(scene: &Scene) -> SceneCache {
-    let world_space_verts: HashMap<u32, Vec<Vec3>> = scene
+    let world_space_verts: Vec<Vec<Vec3>> = scene
         .geometries
         .iter()
         .map(|geom| {
@@ -281,14 +287,11 @@ fn build_cache(scene: &Scene) -> SceneCache {
             for vert in geom.vertices.iter() {
                 transformed_verts.push(transform_vec3(geom.transform, *vert));
             }
-            (geom.id, transformed_verts)
+            transformed_verts
         })
         .collect();
 
-    let bounding_boxes: HashMap<u32, AABB> = world_space_verts
-        .iter()
-        .map(|(id, verts)| (*id, aabb(verts)))
-        .collect();
+    let bounding_boxes: Vec<AABB> = world_space_verts.iter().map(|verts| aabb(verts)).collect();
 
     SceneCache {
         world_space_verts,
@@ -397,7 +400,13 @@ fn read_gltf_node_and_children(
     let transform = parent_transform * transform;
 
     if let Some(mesh) = node.mesh() {
-        geometries.extend(read_gltf_mesh(&mesh, &transform, buffers, images, texture_storage));
+        geometries.extend(read_gltf_mesh(
+            &mesh,
+            &transform,
+            buffers,
+            images,
+            texture_storage,
+        ));
     }
 
     if node.camera().is_some() {
@@ -405,7 +414,15 @@ fn read_gltf_node_and_children(
     }
 
     for child in node.children() {
-        read_gltf_node_and_children(&child, transform, buffers, images, texture_storage, geometries, camera);
+        read_gltf_node_and_children(
+            &child,
+            transform,
+            buffers,
+            images,
+            texture_storage,
+            geometries,
+            camera,
+        );
     }
 }
 
@@ -435,7 +452,15 @@ fn load_scene(path: &Path) -> Result<Scene, gltf::Error> {
 
     for scene in gltf.scenes() {
         for node in scene.nodes() {
-            read_gltf_node_and_children(&node, Mat4::identity(), &buffers, &images, &mut texture_storage, &mut geometries, &mut camera);
+            read_gltf_node_and_children(
+                &node,
+                Mat4::identity(),
+                &buffers,
+                &images,
+                &mut texture_storage,
+                &mut geometries,
+                &mut camera,
+            );
         }
     }
 
@@ -453,8 +478,8 @@ fn load_scene(path: &Path) -> Result<Scene, gltf::Error> {
 #[allow(clippy::many_single_char_names)]
 /// Checks if a ray hits a triangle using the Möller–Trumbore algorithm
 fn intersect(ray: &Ray, face: &Face) -> Option<(f32, Vec3)> {
-    assert!(ray.direction.magnitude() < 1.0 + 0.01);
-    assert!(ray.direction.magnitude() > 1.0 - 0.01);
+    debug_assert!(ray.direction.magnitude() < 1.0 + 0.01);
+    debug_assert!(ray.direction.magnitude() > 1.0 - 0.01);
 
     let Ray {
         origin, direction, ..
@@ -574,15 +599,15 @@ fn trace(scene: &Scene, cache: &SceneCache, ray: &Ray, min_dist: f32, debug: boo
     let mut hit_geom_id = 0;
     let mut hit_face = None;
 
-    for geom in scene.geometries.iter() {
-        let bounding_box = &cache.bounding_boxes[&geom.id];
+    for (geom_idx, geom) in scene.geometries.iter().enumerate() {
+        let bounding_box = &cache.bounding_boxes[geom_idx];
         let hit_bounding_box = intersect_aabb(&ray, bounding_box);
         debug_if!(debug, target: "intersect_aabb", "AABB intersect: {}", hit_bounding_box);
         if !hit_bounding_box {
             continue;
         }
 
-        for face in geom.face_iter(cache) {
+        for face in geom.face_iter(cache, geom_idx) {
             if let Some((dist, p)) = intersect(&ray, &face) {
                 if dist < hit_dist && dist > min_dist {
                     hit_dist = dist;
@@ -614,7 +639,7 @@ fn shade(
 ) -> u32 {
     if let Some(hit) = hit {
         (&scene.lights)
-            .iter()
+            .par_iter()
             .map(|light| {
                 let light_pos = light.position;
                 let hit_to_light = light_pos - hit.point;
@@ -712,25 +737,81 @@ fn render_one_pixel(
     image::Rgb([red as u8, green as u8, blue as u8])
 }
 
+fn render_tile(
+    start_x: u32,
+    start_y: u32,
+    end_x: u32,
+    end_y: u32,
+    scene: &Scene,
+    cache: &SceneCache,
+    render_settings: &RenderSettings,
+) -> Vec<image::Rgb<u8>> {
+    let mut colors = Vec::with_capacity(((end_x - start_x) * (end_y - start_y)) as usize);
+
+    for y in start_y..end_y {
+        for x in start_x..end_x {
+            let color = render_one_pixel((x, y), scene, cache, render_settings);
+            colors.push(color);
+        }
+    }
+
+    colors
+}
+
 fn render(
     scene: &Scene,
     cache: &SceneCache,
     render_settings: &RenderSettings,
-) -> ImageBuffer<image::Rgb<u8>, Vec<u8>> {
+    target: &mut ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+) {
     let (res_w, res_h) = render_settings.resolution;
 
     let begin = std::time::Instant::now();
 
-    let imgbuf = ImageBuffer::from_fn(res_w, res_h, |x, y| {
-        render_one_pixel((x, y), scene, cache, render_settings)
-    });
+    // Render tiles in  parallel
+    let tiles = (0..((res_h + TILE_SIZE - 1) / TILE_SIZE))
+        .into_par_iter()
+        .flat_map(|y_chunk| {
+            (0..((res_w + TILE_SIZE - 1) / TILE_SIZE))
+                .into_par_iter()
+                .map_with(y_chunk, |y_chunk, x_chunk| {
+                    let x = x_chunk * TILE_SIZE;
+                    let y = *y_chunk * TILE_SIZE;
+                    let end_x = (x + TILE_SIZE).min(res_w - 1);
+                    let end_y = (y + TILE_SIZE).min(res_h - 1);
+                    render_tile(x, y, end_x, end_y, scene, cache, render_settings)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    // Combine them into the final image.
+    let tile_cols = res_w / TILE_SIZE;
+    let tile_cols = tile_cols as usize;
+    for (i, tile) in tiles.iter().enumerate() {
+        let x_chunk = i % tile_cols;
+        let y_chunk = i / tile_cols;
+        let x_chunk = x_chunk as u32;
+        let y_chunk = y_chunk as u32;
+        let start_x = x_chunk * TILE_SIZE;
+        let start_y = y_chunk * TILE_SIZE;
+        let end_x = (start_x + TILE_SIZE).min(res_w - 1);
+        let end_y = (start_y + TILE_SIZE).min(res_h - 1);
+        for y in start_y..end_y {
+            for x in start_x..end_x {
+                let tile_x = x - start_x;
+                let tile_y = y - start_y;
+                let tile_width = end_x - start_x;
+                let index = (tile_width * tile_y + tile_x) as usize;
+                target.put_pixel(x, y, tile[index]);
+            }
+        }
+    }
 
     let end = std::time::Instant::now();
     let elapsed = end.duration_since(begin);
 
     info!(target: "perf", "Render finished in {}s{}ms", elapsed.as_secs(), elapsed.subsec_millis());
-
-    imgbuf
 }
 
 fn interactive_loop(scene: &mut Scene, render_settings: &mut RenderSettings) {
@@ -744,6 +825,8 @@ fn interactive_loop(scene: &mut Scene, render_settings: &mut RenderSettings) {
         .position_centered()
         .build()
         .unwrap();
+
+    let mut render_buffer = ImageBuffer::new(res_w, res_h);
 
     let mut canvas = window.into_canvas().build().unwrap();
     let texture_creator = canvas.texture_creator();
@@ -848,8 +931,8 @@ fn interactive_loop(scene: &mut Scene, render_settings: &mut RenderSettings) {
 
             texture
                 .with_lock(None, |buffer: &mut [u8], _pitch: usize| {
-                    let imgbuf = render(scene, &cache, render_settings);
-                    buffer.copy_from_slice(&*imgbuf);
+                    render(scene, &cache, render_settings, &mut render_buffer);
+                    buffer.copy_from_slice(&*render_buffer);
                 })
                 .unwrap();
 
@@ -909,7 +992,9 @@ fn main() {
         let color = render_one_pixel(coord, &scene, &cache, &render_settings);
         println!("Pixel color is {:?}", color);
     } else {
-        let imgbuf = render(&scene, &cache, &render_settings);
+        let mut imgbuf =
+            ImageBuffer::new(render_settings.resolution.0, render_settings.resolution.1);
+        render(&scene, &cache, &render_settings, &mut imgbuf);
         imgbuf.save("image.png").unwrap();
     }
 }
