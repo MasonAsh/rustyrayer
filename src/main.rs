@@ -1,6 +1,6 @@
 use cgmath::{
-    vec2, vec3, Angle, Array, EuclideanSpace, InnerSpace, Matrix4, Point3, Quaternion, Rad,
-    Rotation, Rotation3, SquareMatrix, Transform, Vector2, Vector3, Zero,
+    vec2, vec3, Angle, Array, EuclideanSpace, InnerSpace, Matrix, Matrix4, Point3, Quaternion, Rad,
+    Rotation3, SquareMatrix, Transform, Vector2, Vector3, Zero,
 };
 use env_logger;
 use gltf;
@@ -30,18 +30,6 @@ type Mat4 = Matrix4<f32>;
 
 const FAR_PLANE: f32 = 10_000_000_000.0f32;
 const TILE_SIZE: u32 = 8;
-
-fn compact_color(input: [f32; 4]) -> u32 {
-    let r: u32 = (input[0].max(0.0).min(1.0) * 255.0) as u32;
-    let g: u32 = (input[1].max(0.0).min(1.0) * 255.0) as u32;
-    let b: u32 = (input[2].max(0.0).min(1.0) * 255.0) as u32;
-    let a: u32 = (input[3].max(0.0).min(1.0) * 255.0) as u32;
-    let r = r << 24;
-    let g = g << 16;
-    let b = b << 8;
-
-    r + g + b + a
-}
 
 fn transform_vec3(transform: Mat4, vec: Vec3) -> Vec3 {
     (transform * vec.extend(1.0)).xyz()
@@ -116,13 +104,20 @@ fn aabb(points: &[Vec3]) -> AABB {
     AABB { bounds: [min, max] }
 }
 
+struct Material {
+    color: [f32; 4],
+    diffuse_texture_id: Option<u64>,
+    metallic: f32,
+    roughness: f32,
+}
+
 struct Geometry {
     id: u32,
     vertices: Vec<Vec3>,
+    normals: Vec<Vec3>,
     uvs: Option<Vec<Vec2>>,
     indices: Vec<u32>,
-    color: [f32; 4],
-    diffuse_texture_id: Option<u64>,
+    material: Material,
     transform: Mat4,
 }
 
@@ -131,10 +126,15 @@ impl Default for Geometry {
         Geometry {
             id: rand::random(),
             vertices: Vec::new(),
+            normals: Vec::new(),
             uvs: None,
             indices: Vec::new(),
-            color: [1.0; 4],
-            diffuse_texture_id: None,
+            material: Material {
+                color: [1.0; 4],
+                diffuse_texture_id: None,
+                metallic: 0.0,
+                roughness: 0.0,
+            },
             transform: Mat4::identity(),
         }
     }
@@ -175,9 +175,10 @@ impl TextureStorage {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Face {
     vertices: [Vec3; 3],
+    normals: [Vec3; 3],
     uvs: Option<[Vec2; 3]>,
     normal: Vec3,
     start_index: usize,
@@ -194,15 +195,8 @@ impl Iterator for FaceIter<'_> {
     type Item = Face;
 
     fn next(&mut self) -> Option<Face> {
-        fn calc_normal(vertices: &[Vec3; 3]) -> Vec3 {
-            let u = vertices[1] - vertices[0];
-            let v = vertices[2] - vertices[0];
-
-            vec3(
-                (u.y * v.z) - (u.z * v.y),
-                (u.z * v.x) - (u.x * v.z),
-                (u.x * v.y) - (u.y * v.x),
-            )
+        fn calc_face_normal(normals: &[Vec3; 3]) -> Vec3 {
+            normals.iter().sum::<Vec3>() / 3.0
         }
 
         let FaceIter {
@@ -216,20 +210,26 @@ impl Iterator for FaceIter<'_> {
         self.face_idx += 1;
         if indices_idx < geometry.indices.len() {
             let pretransformed_verts = &cache.world_space_verts[*geometry_idx];
+            let pretransformed_normals = &cache.world_space_normals[*geometry_idx];
             let index0 = geometry.indices[indices_idx] as usize;
             let index1 = geometry.indices[indices_idx + 1] as usize;
             let index2 = geometry.indices[indices_idx + 2] as usize;
             let v0 = pretransformed_verts[index0];
             let v1 = pretransformed_verts[index1];
             let v2 = pretransformed_verts[index2];
+            let n0 = pretransformed_normals[index0];
+            let n1 = pretransformed_normals[index1];
+            let n2 = pretransformed_normals[index2];
             let uvs = geometry
                 .uvs
                 .as_ref()
                 .map(|uvs| [uvs[index0], uvs[index1], uvs[index2]]);
             let vertices = [v0, v1, v2];
-            let normal = calc_normal(&vertices);
+            let normals = [n0, n1, n2];
+            let normal = calc_face_normal(&normals);
             Some(Face {
                 vertices,
+                normals,
                 uvs,
                 normal,
                 start_index: indices_idx,
@@ -260,7 +260,7 @@ struct Camera {
 struct Scene {
     camera: Camera,
     geometries: Vec<Geometry>,
-    ambient_light: [f32; 3],
+    ambient_light: Vec3,
     lights: Vec<Light>,
     texture_storage: TextureStorage,
 }
@@ -275,6 +275,7 @@ impl Scene {
 /// SceneCache holds all the hot data that should be precomputed before a render.
 struct SceneCache {
     world_space_verts: Vec<Vec<Vec3>>,
+    world_space_normals: Vec<Vec<Vec3>>,
     bounding_boxes: Vec<AABB>,
 }
 
@@ -291,18 +292,51 @@ fn build_cache(scene: &Scene) -> SceneCache {
         })
         .collect();
 
+    let world_space_normals: Vec<Vec<Vec3>> = scene
+        .geometries
+        .iter()
+        .map(|geom| {
+            let normal_matrix = geom.transform.inverse_transform().unwrap().transpose();
+            let mut transformed_normals = Vec::with_capacity(geom.normals.len());
+            for normal in geom.normals.iter() {
+                let normal = normal_matrix * normal.extend(0.0);
+                transformed_normals.push(normal.xyz().normalize());
+            }
+            transformed_normals
+        })
+        .collect();
+
     let bounding_boxes: Vec<AABB> = world_space_verts.iter().map(|verts| aabb(verts)).collect();
 
     SceneCache {
         world_space_verts,
+        world_space_normals,
         bounding_boxes,
     }
 }
 
 struct RenderSettings {
     resolution: (u32, u32),
-    background_color: u32,
+    background_color: Vec3,
     debug_coord: Option<(u32, u32)>,
+    max_ray_bounces: u32,
+}
+
+fn generate_smooth_normals(indices: &[u32], positions: &[Vec3]) -> Vec<Vec3> {
+    let mut normals = vec![Vec3::zero(); positions.len()];
+
+    for triangle in indices.chunks(3) {
+        let (i0, i1, i2) = (triangle[0], triangle[1], triangle[2]);
+        let a = positions[i0 as usize];
+        let b = positions[i1 as usize];
+        let c = positions[i2 as usize];
+        let p = (b - a).cross(c - a);
+        normals[i0 as usize] += p;
+        normals[i1 as usize] += p;
+        normals[i2 as usize] += p;
+    }
+
+    normals
 }
 
 fn read_gltf_mesh(
@@ -354,6 +388,14 @@ fn read_gltf_mesh(
             let indices = reader.read_indices().unwrap();
             let indices = indices.into_u32().collect::<Vec<_>>();
 
+            let normals = if let Some(normals) = reader.read_normals() {
+                normals
+                    .map(|normal| vec3(normal[0], normal[1], normal[2]))
+                    .collect::<Vec<_>>()
+            } else {
+                generate_smooth_normals(&indices, &positions)
+            };
+
             let material = prim.material();
             let pbr = material.pbr_metallic_roughness();
             let color = pbr.base_color_factor();
@@ -374,13 +416,23 @@ fn read_gltf_mesh(
                 });
             }
 
+            let metallic = pbr.metallic_factor();
+            let roughness = pbr.roughness_factor();
+
+            debug!(target: "material", "base color: {:?} diffuse_texture: {} metallic: {} roughness: {}", color, diffuse_texture_id.is_some(), metallic, roughness);
+
             Geometry {
                 vertices: positions,
+                normals,
                 indices,
                 uvs,
                 transform: *transform,
-                diffuse_texture_id,
-                color,
+                material: Material {
+                    color,
+                    diffuse_texture_id,
+                    metallic,
+                    roughness,
+                },
                 ..Default::default()
             }
         })
@@ -467,7 +519,7 @@ fn load_scene(path: &Path) -> Result<Scene, gltf::Error> {
     Ok(Scene {
         camera,
         geometries,
-        ambient_light: [0.04, 0.04, 0.04],
+        ambient_light: vec3(0.04, 0.04, 0.04),
         lights: vec![Light {
             position: vec3(2.0, 2.0, 2.0),
         }],
@@ -513,14 +565,17 @@ fn intersect(ray: &Ray, face: &Face) -> Option<(f32, Vec3)> {
 }
 
 fn transform_dir(transform: &Mat4, dir: &Vec3) -> Vec3 {
-    use cgmath::Matrix3;
-    let rot = Matrix3::from_cols(transform.x.xyz(), transform.y.xyz(), transform.z.xyz());
+    //use cgmath::Matrix3;
+    //let rot = Matrix3::from_cols(transform.x.xyz(), transform.y.xyz(), transform.z.xyz());
 
-    let rot: Quaternion<f32> = rot.into();
+    //let rot: Quaternion<f32> = rot.into();
 
-    let res = rot.rotate_vector(*dir);
+    //let res = rot.rotate_vector(*dir);
 
-    vec3(res.x, res.y, res.z)
+    //vec3(res.x, res.y, res.z)
+    (transform.inverse_transform().unwrap().transpose() * dir.extend(0.0))
+        .xyz()
+        .normalize()
 }
 
 fn intersect_aabb(ray: &Ray, bb: &AABB) -> bool {
@@ -553,8 +608,18 @@ fn intersect_aabb(ray: &Ray, bb: &AABB) -> bool {
     true
 }
 
+fn sample_normal(
+    hit_point: Vec3,     // in view space
+    vertices: [Vec3; 3], // in view space
+    [n0, n1, n2]: [Vec3; 3],
+) -> Vec3 {
+    let [b0, b1, b2] = bary_coords(hit_point, vertices);
+
+    ((b0 * n0) + (b1 * n1) + (b2 * n2)).normalize()
+}
+
 #[allow(clippy::many_single_char_names)]
-fn sample(
+fn sample_image(
     hit_point: Vec3,     // in view space
     vertices: [Vec3; 3], // in view space
     [uv0, uv1, uv2]: [Vec2; 3],
@@ -586,6 +651,7 @@ fn sample(
     [r as f32, g as f32, b as f32, a as f32]
 }
 
+#[derive(Clone)]
 struct Hit {
     face: Face,
     geometry_id: u32,
@@ -634,9 +700,9 @@ fn shade(
     scene: &Scene,
     cache: &SceneCache,
     hit: Option<&Hit>,
-    background_color: u32,
+    background_color: Vec3,
     debug: bool,
-) -> u32 {
+) -> Vec3 {
     if let Some(hit) = hit {
         (&scene.lights)
             .par_iter()
@@ -650,10 +716,11 @@ fn shade(
                 // TODO: The minimum distance is the trace was determined by trial and error to minimize
                 // self intersecting artifacts but isn't perfect.
                 let ray = Ray::new(hit.point, hit_to_light);
-                let is_shadowed = trace(scene, cache, &ray, 0.000_005, debug).filter(|shadow_hit| (shadow_hit.point - hit.point).magnitude2()  < hit_light_dist2).is_some();
+                let is_shadowed = trace(scene, cache, &ray, 0.005, debug).filter(|shadow_hit| (shadow_hit.point - hit.point).magnitude2()  < hit_light_dist2).is_some();
                 debug_if!(debug, target: "shade", "shadowed: {}", is_shadowed);
 
-                let angle = hit_to_light.angle(hit.face.normal);
+                let normal = sample_normal(hit.point, hit.face.vertices, hit.face.normals);
+                let angle = hit_to_light.angle(normal);
                 let shade = if !is_shadowed { angle.cos().abs() } else { 0.0 };
 
                 debug_if!(debug, target: "shade", "shade={} P={:?} angle={:?} light={:?} raydir={:?}", shade, hit.point, angle, light_pos, hit.ray.direction);
@@ -662,7 +729,7 @@ fn shade(
 
                 let geometry = &scene.get_geometry(hit.geometry_id).unwrap();
 
-                let texture_id = geometry.diffuse_texture_id;
+                let texture_id = geometry.material.diffuse_texture_id;
                 let image = texture_id.and_then(|texture_id| {
                     scene.texture_storage.fetch(texture_id)
                 });
@@ -670,28 +737,119 @@ fn shade(
                 let diffuse_color =
                     match (image, hit.face.uvs) {
                         (Some(image), Some(uvs)) => {
-                            sample(hit.point, hit.face.vertices, uvs, &image, debug)
+                            sample_image(hit.point, hit.face.vertices, uvs, &image, debug)
                         },
                         _ => {
-                            geometry.color
+                            geometry.material.color
                         }
                     };
 
                 let ambient_light = scene.ambient_light;
 
-                let final_color = [
+                vec3(
                     (ambient_light[0]) + (diffuse_color[0] * shade),
                     (ambient_light[1]) + (diffuse_color[1] * shade),
                     (ambient_light[2]) + (diffuse_color[2] * shade),
-                    diffuse_color[3],
-                ];
-
-                compact_color(final_color)
+                )
             })
             .sum()
     } else {
         background_color
     }
+}
+
+fn reflect(incident: Vec3, normal: Vec3) -> Vec3 {
+    incident - (2.0 * incident.dot(normal) * normal)
+}
+
+fn cast_reflection_rays(
+    primary_ray: &Ray,
+    hit: &Hit,
+    scene: &Scene,
+    cache: &SceneCache,
+    render_settings: &RenderSettings,
+    debug: bool,
+) -> Vec3 {
+    fn reflect_ray(hit: &Hit, ray_direction: Vec3) -> Ray {
+        let normal = sample_normal(hit.point, hit.face.vertices, hit.face.normals);
+        let reflection_origin = hit.point;
+        let reflect_direction = reflect(ray_direction, normal);
+        let reflection_origin = reflection_origin + reflect_direction * 0.1;
+        Ray::new(reflection_origin, reflect_direction)
+    }
+
+    let RenderSettings {
+        background_color,
+        max_ray_bounces,
+        ..
+    } = render_settings;
+
+    let mut hit = Some(hit.clone());
+    let mut ray_direction = primary_ray.direction;
+    let mut color = Vec3::zero();
+    let hit_geom = scene
+        .get_geometry(hit.as_ref().unwrap().geometry_id)
+        .unwrap();
+    if hit_geom.material.metallic < core::f32::EPSILON {
+        return color;
+    }
+
+    for _ in 0..*max_ray_bounces {
+        if hit.is_none() {
+            break;
+        }
+
+        let hit_geom = scene
+            .get_geometry(hit.as_ref().unwrap().geometry_id)
+            .unwrap();
+        let inverse_roughness = (1.0 - hit_geom.material.roughness.max(0.000_001)).abs();
+        debug_if!(debug, target: "shade", "roughness {} 1/roughness {}", hit_geom.material.roughness, inverse_roughness);
+
+        let reflection_ray = reflect_ray(&hit.unwrap(), ray_direction);
+        hit = trace(scene, cache, &reflection_ray, 0.00001, debug);
+
+        if hit.is_none() {
+            color += inverse_roughness * background_color;
+            break;
+        }
+
+        color += inverse_roughness * shade(scene, cache, hit.as_ref(), *background_color, debug);
+        ray_direction = reflection_ray.direction;
+
+        if hit_geom.material.metallic < core::f32::EPSILON {
+            break;
+        }
+    }
+
+    color
+}
+
+fn cast_primary_ray(
+    ray: &Ray,
+    scene: &Scene,
+    cache: &SceneCache,
+    render_settings: &RenderSettings,
+    debug: bool,
+) -> Vec3 {
+    let hit = trace(scene, cache, ray, 0.0, debug);
+
+    let background_color = render_settings.background_color;
+
+    let mut color: Vec3 = background_color;
+
+    if let Some(hit) = hit {
+        color = shade(
+            scene,
+            cache,
+            Some(&hit),
+            render_settings.background_color,
+            debug,
+        );
+
+        color += cast_reflection_rays(ray, &hit, scene, cache, render_settings, debug);
+    }
+
+    color
 }
 
 fn render_one_pixel(
@@ -723,18 +881,22 @@ fn render_one_pixel(
     debug_if!(debug, target: "ray", "ray: {:?}", ray_direction);
 
     let ray = Ray::new(ray_origin, ray_direction);
-    let hit = trace(&scene, &cache, &ray, 0.0, debug);
-    let color = shade(
-        scene,
-        cache,
-        hit.as_ref(),
-        render_settings.background_color,
-        debug,
+    let color = cast_primary_ray(&ray, scene, cache, render_settings, debug);
+
+    // Clamp the color to the 0.0 to 1.0 range.
+    let color = vec3(
+        color.x.min(1.0).max(0.0),
+        color.y.min(1.0).max(0.0),
+        color.z.min(1.0).max(0.0),
     );
-    let red = (color & 0xFF_00_00_00) >> 24;
-    let green = (color & 0x00_FF_00_00) >> 16;
-    let blue = (color & 0x00_00_FF_00) >> 8;
-    image::Rgb([red as u8, green as u8, blue as u8])
+
+    let red = color.x * 255.0;
+    let green = color.y * 255.0;
+    let blue = color.z * 255.0;
+    let red = red as u8;
+    let green = green as u8;
+    let blue = blue as u8;
+    image::Rgb([red, green, blue])
 }
 
 fn render_tile(
@@ -978,8 +1140,9 @@ fn main() {
 
     let mut render_settings = RenderSettings {
         resolution: (640, 480),
-        background_color: 0,
+        background_color: vec3(0.1, 0.1, 0.1),
         debug_coord: single_debug_coord,
+        max_ray_bounces: 4,
     };
 
     let interactive_mode = std::env::args().any(|arg| arg == "--interactive");
