@@ -636,7 +636,6 @@ fn sample_image(
     let (width, height) = image.dimensions();
     let (width, height) = (width as f32, height as f32);
     let (x, y) = (width * uv.x, height * uv.y);
-    let y = height - y;
     let (x, y) = (x.min(width - 1.0).max(0.0), y.min(height - 1.0).max(0.0));
     let (x, y) = (x as u32, y as u32);
     let pixel = image.get_pixel(x, y);
